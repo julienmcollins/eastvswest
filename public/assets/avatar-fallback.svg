@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Ours, not a Strava asset. Served for any rider whose avatar_url is null (Strava returns
+  the bare relative string "avatar/athlete/large.png" for photo-less athletes, which the
+  server normalizes to null) or whose avatar_url fails the https: check in format.js.
+  Deliberately mid-grey so it reads on both light and dark backgrounds.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="">
+  <circle cx="32" cy="32" r="32" fill="#9AA0A6" fill-opacity="0.28"/>
+  <circle cx="32" cy="24" r="11" fill="#9AA0A6"/>
+  <path d="M32 39c-11 0-20 7.2-20 16.1V64h40v-8.9C52 46.2 43 39 32 39z" fill="#9AA0A6"/>
+</svg>

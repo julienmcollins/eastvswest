@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PLACEHOLDER. NOT THE OFFICIAL STRAVA ASSET.
+
+  Hand-authored stand-in for the official "Powered by Strava" logo, created only because
+  developers.strava.com was unreachable from the build environment. Strava orange is
+  #FC5200.
+
+  MUST be replaced, byte-for-byte unmodified, with the official "Powered by Strava" logo
+  from https://developers.strava.com/guidelines/ before any public deployment. This mark
+  is a contractual attribution requirement and must stay visible without interaction on
+  every view that displays Strava data. See ./README.md.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="140" height="28" viewBox="0 0 140 28" role="img" aria-label="Powered by Strava">
+  <title>Powered by Strava</title>
+  <text x="0" y="19" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#6B7280">Powered by</text>
+  <text x="74" y="19" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="700" fill="#FC5200">STRAVA</text>
+</svg>

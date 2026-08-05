@@ -1,0 +1,426 @@
+/*
+ * bike-comp — East vs West leaderboard.
+ *
+ * Zero dependencies, no build step, no preprocessor. Plain CSS loaded directly.
+ *
+ * Theming rules, both load-bearing:
+ *   1. `color-scheme: light dark` on :root, so form controls, scrollbars and the <dialog>
+ *      backdrop follow the OS theme instead of staying stuck in light mode.
+ *   2. Every colour is a custom property, redefined once under
+ *      `prefers-color-scheme: dark`. No rule paints a pure-white or pure-black
+ *      anywhere: pure white on an OLED phone at night is unpleasant, and pure black
+ *      loses every border.
+ *
+ * The "Connect with Strava" button is an <img> and gets ONLY box sizing here. It must
+ * never be recoloured, filtered, re-rounded or otherwise restyled — that is a term of the
+ * Strava API Agreement, not a preference. Same for "Powered by Strava".
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Light theme */
+  --bg: #f4f5f7;
+  --surface: #fbfbfc;
+  --surface-2: #eef0f3;
+  --text: #1b1f24;
+  --text-muted: #5c636d;
+  --border: #d8dce2;
+  --border-strong: #b9c0c9;
+
+  --east: #3b6fd4;
+  --east-soft: #dce6fa;
+  --west: #8b5cf6;
+  --west-soft: #e8dffd;
+
+  --accent: #1b6f4a;
+  --warn: #8a5a00;
+  --warn-soft: #fdf3dd;
+  --danger: #a32020;
+  --danger-soft: #fbe4e4;
+  --info-soft: #e3ecfa;
+
+  /* Strava orange. Present only for the placeholder assets' documentation value; no
+     element in this stylesheet paints with it, because the brand assets are images. */
+  --strava: #fc5200;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgb(16 18 21 / 8%), 0 4px 16px rgb(16 18 21 / 6%);
+  --focus: 0 0 0 3px rgb(59 111 212 / 45%);
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-num: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --surface: #1b1f25;
+    --surface-2: #23282f;
+    --text: #e8eaee;
+    --text-muted: #a2aab5;
+    --border: #2f353d;
+    --border-strong: #414954;
+
+    --east: #6f9bf2;
+    --east-soft: #22314d;
+    --west: #b592fb;
+    --west-soft: #2e2549;
+
+    --accent: #58c08d;
+    --warn: #e5b562;
+    --warn-soft: #33290f;
+    --danger: #f08a8a;
+    --danger-soft: #3a1d1d;
+    --info-soft: #1e2836;
+
+    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 6px 20px rgb(0 0 0 / 30%);
+    --focus: 0 0 0 3px rgb(111 155 242 / 50%);
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0 auto;
+  padding: clamp(0.75rem, 2vw, 2rem);
+  max-width: 62rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+h1, h2, h3 { line-height: 1.2; margin: 0; }
+
+:where(a) { color: var(--east); }
+:where(a:focus-visible), :where(button:focus-visible) {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: var(--radius-sm);
+}
+
+.muted { color: var(--text-muted); font-size: 0.875rem; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ------------------------------------------------------------------- masthead ---- */
+
+.masthead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.masthead h1 { font-size: clamp(1.5rem, 4vw, 2rem); letter-spacing: -0.02em; }
+.masthead h1 .vs { color: var(--text-muted); font-weight: 400; }
+
+.window { margin: 0.35rem 0 0; font-size: 0.95rem; color: var(--text-muted); }
+.window .dot { opacity: 0.55; margin: 0 0.35rem; }
+.window-status { color: var(--text); font-weight: 600; }
+.window-status[data-state="closed"] { color: var(--text-muted); font-weight: 500; }
+.window-meta { margin: 0.2rem 0 0; font-size: 0.8125rem; color: var(--text-muted); }
+
+.masthead-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.viewer { display: flex; align-items: center; gap: 0.5rem; }
+.viewer-text { display: flex; flex-direction: column; line-height: 1.2; }
+.viewer-name { font-weight: 600; font-size: 0.9rem; }
+
+/* ------------------------------------------------------------------- controls ---- */
+
+.btn {
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.85rem;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) { background: var(--surface-2); }
+.btn:disabled { cursor: default; opacity: 0.6; }
+.btn.is-pending { cursor: progress; }
+.btn-sm { padding: 0.3rem 0.6rem; font-size: 0.8125rem; }
+.btn-quiet { background: transparent; border-color: var(--border); color: var(--text-muted); }
+.btn-primary { border-color: var(--east); color: var(--east); background: var(--east-soft); }
+.btn-warn { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); text-decoration: none; }
+
+/*
+ * Box sizing ONLY. Do not add background, filter, border-radius, or any colour here:
+ * the official Strava button must be rendered unmodified.
+ */
+.strava-connect { display: inline-flex; line-height: 0; }
+.strava-connect img { width: 193px; height: 48px; }
+.strava-connect:hover { opacity: 0.92; }
+
+/* ------------------------------------------------------------------- banners ---- */
+
+.banners { display: flex; flex-direction: column; gap: 0.5rem; margin: 1rem 0 0; }
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--info-soft);
+  font-size: 0.9rem;
+}
+.banner-text { flex: 1 1 18rem; }
+.banner-warn { background: var(--warn-soft); border-color: var(--warn); }
+.banner-error { background: var(--danger-soft); border-color: var(--danger); }
+.banner-dismiss {
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  background: transparent;
+  border: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 0.25rem;
+}
+
+/* ---------------------------------------------------------------- scoreboard ---- */
+
+.scoreboard {
+  margin: 1.25rem 0;
+  padding: clamp(0.9rem, 2vw, 1.4rem);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.scores { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; }
+.score { flex: 1 1 10rem; min-width: 8rem; }
+.score:last-child { text-align: right; }
+
+.score-label { margin: 0; font-size: 0.8125rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.score-east .score-label { color: var(--east); }
+.score-west .score-label { color: var(--west); }
+
+.score-value {
+  margin: 0.1rem 0 0;
+  font-family: var(--font-num);
+  /* Tabular figures: totals must not jitter horizontally as they tick up. */
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(2rem, 8vw, 3.25rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+.score-unit { font-size: 0.9rem; font-weight: 600; color: var(--text-muted); margin-left: 0.3rem; }
+.score-share { margin: 0; font-size: 1rem; font-weight: 600; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.score-sub { margin: 0.15rem 0 0; font-size: 0.8125rem; color: var(--text-muted); }
+
+.split {
+  display: flex;
+  height: 14px;
+  margin: 1rem 0 0.75rem;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+/* Widths come from the --share custom property, set through CSSOM in render.js. A style=""
+   attribute in markup would be blocked by `style-src 'self'`; programmatic CSSOM is not. */
+.split-fill { width: var(--share, 50%); transition: width 240ms ease; }
+.split-fill-east { background: var(--east); }
+.split-fill-west { background: var(--west); }
+
+@media (prefers-reduced-motion: reduce) {
+  .split-fill { transition: none; }
+}
+
+.leader-line { margin: 0; font-size: 1.05rem; font-weight: 600; }
+.leader-line.is-tie { font-weight: 500; color: var(--text-muted); }
+.totals-line { margin: 0.2rem 0 0; font-size: 0.875rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* ---------------------------------------------------------------- empty state ---- */
+
+.empty-state {
+  margin: 1.25rem 0;
+  padding: 1.5rem;
+  text-align: center;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.empty-state h2 { font-size: 1.15rem; }
+.empty-state p { margin: 0.5rem auto 0; max-width: 34rem; color: var(--text-muted); }
+
+/* --------------------------------------------------------------------- roster ---- */
+
+.roster { margin: 1.5rem 0; }
+.roster h2 { font-size: 1.15rem; margin-bottom: 0.5rem; }
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+table.riders { width: 100%; border-collapse: collapse; font-size: 0.9375rem; }
+
+table.riders th, table.riders td {
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+table.riders tbody tr:last-child td { border-bottom: 0; }
+
+table.riders th {
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  position: sticky;
+  top: 0;
+}
+
+.num { text-align: right; font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.col-rank { width: 3rem; text-align: right; color: var(--text-muted); }
+.col-miles { font-weight: 700; }
+
+.rider-row.is-you { background: var(--east-soft); }
+.rider-row.is-you .col-rank { color: var(--text); }
+/* A left rail rather than a colour-only cue, so "your row" survives colour blindness. */
+.rider-row.is-you td:first-child { box-shadow: inset 3px 0 0 0 var(--east); }
+.rider-row.is-unranked { color: var(--text-muted); }
+.rider-row.is-frozen .col-miles { opacity: 0.75; }
+
+.col-rider { display: flex; align-items: center; gap: 0.6rem; }
+.rider-ident { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.rider-name { display: flex; align-items: center; gap: 0.4rem; }
+.rider-name a { color: inherit; text-decoration: none; font-weight: 600; }
+.rider-name a:hover { text-decoration: underline; }
+.rider-name a.no-link { color: var(--text-muted); cursor: default; }
+
+.avatar { border-radius: 50%; background: var(--surface-2); object-fit: cover; flex: 0 0 auto; }
+.avatar-sm { width: 28px; height: 28px; }
+
+.you-tag {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--east);
+  border: 1px solid var(--east);
+  border-radius: 999px;
+  padding: 0 0.35rem;
+}
+
+.chip {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.chip[data-team="EAST"] { background: var(--east-soft); color: var(--east); }
+.chip[data-team="WEST"] { background: var(--west-soft); color: var(--west); }
+.chip-sm { font-size: 0.6875rem; }
+
+.badges { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.badge {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  background: var(--surface-2);
+  cursor: help;
+}
+.badge-revoked { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+
+/* --------------------------------------------------------------- team dialog ---- */
+
+.team-dialog {
+  max-width: 30rem;
+  width: calc(100% - 2rem);
+  padding: 1.4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+.team-dialog::backdrop { background: rgb(10 12 15 / 55%); }
+.team-dialog h2 { font-size: 1.2rem; }
+.team-dialog p { color: var(--text-muted); }
+
+.team-choices { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1rem 0; }
+.btn-team {
+  flex: 1 1 9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  align-items: flex-start;
+  padding: 0.8rem 1rem;
+}
+.btn-team-name { font-size: 1.15rem; font-weight: 700; }
+.btn-team-sub { font-size: 0.8125rem; font-weight: 500; color: var(--text-muted); }
+.btn-team-east { border-color: var(--east); background: var(--east-soft); }
+.btn-team-east .btn-team-name { color: var(--east); }
+.btn-team-west { border-color: var(--west); background: var(--west-soft); }
+.btn-team-west .btn-team-name { color: var(--west); }
+
+.dialog-error { margin: 0 0 0.5rem; color: var(--danger); font-size: 0.875rem; min-height: 1.2em; }
+.dialog-error:empty { min-height: 0; }
+
+/* --------------------------------------------------------------------- footer ---- */
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+/* Attribution is a contractual requirement: visible without interaction. Never add
+   display:none, visibility:hidden, opacity:0, or a hover-only reveal to .powered-by. */
+.powered-by { display: inline-flex; line-height: 0; flex: 0 0 auto; }
+.powered-by img { width: 140px; height: 28px; }
+.footer-note { flex: 1 1 20rem; margin: 0; }
+
+/* ------------------------------------------------------------------- narrow ---- */
+
+@media (max-width: 34rem) {
+  .score:last-child { text-align: left; }
+  .masthead-actions { width: 100%; }
+  table.riders th:nth-child(6), table.riders td:nth-child(6) { display: none; }
+}

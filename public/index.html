@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>East vs West — Strava mileage leaderboard</title>
+<meta name="description" content="An East-versus-West cycling mileage leaderboard, powered by Strava.">
+<meta name="color-scheme" content="light dark">
+
+<!--
+  Content Security Policy, shipped from day one.
+
+  This is a security control, not hardening theatre: rider display names come straight
+  from Strava and are attacker-controlled, so text is assigned through textContent
+  everywhere in render.js and this policy is the backstop if that discipline ever slips.
+
+  KNOWN LIMITATION: a <meta> CSP cannot express frame-ancestors or report-uri — those are
+  header-only directives and are silently ignored here. That is accepted because there are
+  no state-changing GET routes to clickjack; server/http/static.js additionally sends
+  X-Frame-Options: DENY on HTML locally, and after the Pages migration this must move to a
+  real header (or the site must sit behind a host that can set one).
+
+  Two directives are load-bearing for how the code is written:
+    style-src 'self'  -> no style block and no inline style attribute anywhere in this
+                         file. Dynamic widths (the split bar) are set via CSSOM in
+                         render.js, which CSP does not restrict.
+    connect-src 'self' -> MUST be widened to the API origin in the SAME COMMIT that adds a
+                         host to public/config.js, or the site silently stops talking to
+                         its own API with no CORS error and no 4xx to debug.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+
+<!-- Every path in this file is RELATIVE. At deploy time the Pages artifact root IS
+     public/, so a root-absolute "/styles.css" 404s under a project-site subpath. -->
+<link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="./styles.css?v=1">
+</head>
+<body>
+
+<!-- Live region for transient progress. Polite: it must not interrupt a screen reader
+     mid-sentence just because a sync finished. -->
+<p id="status" class="visually-hidden" role="status" aria-live="polite"></p>
+
+<header class="masthead">
+  <div class="masthead-title">
+    <h1>East <span class="vs">vs</span> West</h1>
+    <p class="window">
+      <span id="window-range">…</span>
+      <span class="dot">·</span>
+      <span id="window-status" class="window-status">…</span>
+    </p>
+    <p id="window-meta" class="window-meta"></p>
+  </div>
+
+  <div class="masthead-actions">
+    <div id="viewer" class="viewer" hidden>
+      <img id="viewer-avatar" class="avatar avatar-sm" src="./assets/avatar-fallback.svg" alt="" width="28" height="28" decoding="async">
+      <span class="viewer-text">
+        <span id="viewer-name" class="viewer-name"></span>
+        <span id="viewer-team" class="chip chip-sm"></span>
+      </span>
+    </div>
+
+    <!-- Persistent path to the team picker, so the modal is never the only way in. -->
+    <button type="button" id="btn-pick-team" class="btn btn-primary" hidden>Pick your team</button>
+
+    <button type="button" id="btn-refresh" class="btn" hidden aria-busy="false">
+      <span data-f="label">Refresh</span>
+    </button>
+
+    <a id="btn-reconnect" class="btn btn-warn" href="./api/auth/strava/reconnect" hidden>Reconnect Strava</a>
+
+    <button type="button" id="btn-logout" class="btn btn-quiet" hidden>Sign out</button>
+
+    <!--
+      ============================================================================
+      STRAVA BRAND ASSET — PLACEHOLDER. MUST BE REPLACED BEFORE PUBLIC DEPLOYMENT.
+      ============================================================================
+      ./assets/btn-strava-connect.svg is a HAND-AUTHORED STAND-IN, created only because
+      developers.strava.com was unreachable from the build environment. It is NOT the
+      official artwork, and shipping it publicly breaches the Strava API Agreement.
+
+      Replace it with the official "Connect with Strava" button from
+      https://developers.strava.com/guidelines/ — byte-for-byte unmodified.
+
+      The official button MUST NOT be restyled, recoloured, re-exported, re-traced,
+      resized below the documented minimum, or have its wording translated. It is an
+      <img> precisely so no stylesheet can reach inside it; styles.css only ever sets its
+      box size. See public/assets/README.md.
+
+      The href here is relative so it still works with JavaScript disabled on the
+      single-origin deploy; app.js overwrites it from public/config.js on boot. It is a
+      plain link because /api/auth/strava/login answers 302 to strava.com and must be a
+      TOP-LEVEL NAVIGATION — a fetch of a cross-origin redirect fails CORS.
+      ============================================================================
+    -->
+    <a id="btn-connect" class="strava-connect" href="./api/auth/strava/login">
+      <img src="./assets/btn-strava-connect.svg" alt="Connect with Strava" width="193" height="48">
+    </a>
+  </div>
+</header>
+
+<div id="banners" class="banners"></div>
+
+<main>
+
+  <section id="scoreboard" class="scoreboard" aria-labelledby="scoreboard-heading">
+    <h2 id="scoreboard-heading" class="visually-hidden">Team totals</h2>
+
+    <div class="scores">
+      <div class="score score-east" data-team="EAST">
+        <p class="score-label"><span id="east-label">East</span></p>
+        <p class="score-value"><span id="east-miles">0.0</span><span class="score-unit">mi</span></p>
+        <p class="score-share" id="east-share">50%</p>
+        <p class="score-sub" id="east-sub"></p>
+      </div>
+      <div class="score score-west" data-team="WEST">
+        <p class="score-label"><span id="west-label">West</span></p>
+        <p class="score-value"><span id="west-miles">0.0</span><span class="score-unit">mi</span></p>
+        <p class="score-share" id="west-share">50%</p>
+        <p class="score-sub" id="west-sub"></p>
+      </div>
+    </div>
+
+    <div id="split-bar" class="split" role="img" aria-label="Team share of total miles">
+      <div id="split-east" class="split-fill split-fill-east"></div>
+      <div id="split-west" class="split-fill split-fill-west"></div>
+    </div>
+
+    <p id="leader-line" class="leader-line"></p>
+    <p id="totals-line" class="totals-line"></p>
+  </section>
+
+  <!-- Shown while sync.last_synced_at is null. An empty table with no explanation reads
+       as a broken page, so we say plainly that nothing has been fetched yet. -->
+  <section id="empty-state" class="empty-state" hidden>
+    <h2>No rides yet</h2>
+    <p>Nobody has synced with Strava yet, so there is nothing on the board. Connect with Strava and press Refresh — your rides in the competition window will appear here.</p>
+  </section>
+
+  <section id="roster" class="roster" aria-labelledby="roster-heading" hidden>
+    <h2 id="roster-heading">Riders</h2>
+    <div class="table-wrap">
+      <table class="riders">
+        <thead>
+          <tr>
+            <th scope="col" class="col-rank">#</th>
+            <th scope="col" class="col-rider">Rider</th>
+            <th scope="col" class="col-team">Team</th>
+            <th scope="col" class="num">Miles</th>
+            <th scope="col" class="num">Rides</th>
+            <th scope="col" class="num">Longest</th>
+          </tr>
+        </thead>
+        <tbody id="rider-rows"></tbody>
+      </table>
+    </div>
+    <p id="roster-empty" class="muted" hidden>No riders have joined a team yet.</p>
+    <p id="roster-note" class="muted"></p>
+    <p id="sync-line" class="muted"></p>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <!--
+    ============================================================================
+    STRAVA BRAND ASSET — PLACEHOLDER. MUST BE REPLACED BEFORE PUBLIC DEPLOYMENT.
+    ============================================================================
+    ./assets/powered-by-strava.svg is a HAND-AUTHORED STAND-IN. Replace it with the
+    official "Powered by Strava" logo from https://developers.strava.com/guidelines/ —
+    byte-for-byte unmodified. See public/assets/README.md.
+
+    This mark is a CONTRACTUAL attribution requirement, not decoration: it must be
+    visible WITHOUT INTERACTION on every view that shows Strava data. It therefore sits
+    in the always-rendered page footer, never behind a tab, hover, accordion or
+    scroll-triggered reveal, and it is never hidden by script.
+    ============================================================================
+  -->
+  <a class="powered-by" href="https://www.strava.com" target="_blank" rel="noopener noreferrer">
+    <img src="./assets/powered-by-strava.svg" alt="Powered by Strava" width="140" height="28">
+  </a>
+  <p class="muted footer-note">
+    Distances come from each rider's own Strava account, which they connected themselves.
+    Totals are in miles and count only the sport types listed above.
+  </p>
+</footer>
+
+<!--
+  One-time team picker. `needs_team` from GET /api/me is the ONE authoritative trigger —
+  there is no #pick-team fragment and no inference from team === null anywhere.
+
+  There is no <form method="dialog">: form-action 'none' in the CSP above, and the choice
+  is a POST through api.js, not a form submission. app.js listens for `close` and reopens
+  while needs_team is still true, because preventing `cancel` is unreliable without
+  history-action user activation and two Escape presses would otherwise dismiss a
+  mandatory choice for good.
+-->
+<dialog id="team-dialog" class="team-dialog" aria-labelledby="team-dialog-title">
+  <h2 id="team-dialog-title">Pick your team</h2>
+  <p>This is a one-time choice and it cannot be changed afterwards. Every mile you ride counts for this team.</p>
+  <div class="team-choices">
+    <button type="button" class="btn btn-team btn-team-east" data-team="EAST">
+      <span class="btn-team-name">East</span>
+      <span class="btn-team-sub">Join the East</span>
+    </button>
+    <button type="button" class="btn btn-team btn-team-west" data-team="WEST">
+      <span class="btn-team-name">West</span>
+      <span class="btn-team-sub">Join the West</span>
+    </button>
+  </div>
+  <p id="team-dialog-error" class="dialog-error" role="alert"></p>
+  <button type="button" id="btn-dialog-logout" class="btn btn-quiet btn-sm">Sign out instead</button>
+</dialog>
+
+<!-- Row template. Cloned per rider in render.js; every text node is written with
+     textContent, so a rider named after a script tag is inert text. -->
+<template id="tpl-rider-row">
+  <tr class="rider-row">
+    <td class="col-rank num"><span data-f="rank"></span></td>
+    <td class="col-rider">
+      <img class="avatar" data-f="avatar" src="./assets/avatar-fallback.svg" alt="" width="32" height="32" decoding="async" loading="lazy" referrerpolicy="no-referrer">
+      <span class="rider-ident">
+        <span class="rider-name">
+          <!-- Deep-link back to the athlete on Strava, per the brand guidelines. -->
+          <a data-f="profile" target="_blank" rel="noopener noreferrer"></a>
+          <span class="you-tag" data-f="youtag" hidden>you</span>
+        </span>
+        <span class="badges" data-f="badges"></span>
+      </span>
+    </td>
+    <td class="col-team"><span class="chip" data-f="team"></span></td>
+    <td class="num col-miles" data-f="miles"></td>
+    <td class="num" data-f="rides"></td>
+    <td class="num" data-f="longest"></td>
+  </tr>
+</template>
+
+<template id="tpl-banner">
+  <div class="banner">
+    <span class="banner-text" data-f="text"></span>
+    <button type="button" class="btn btn-sm banner-action" data-f="action" hidden></button>
+    <button type="button" class="banner-dismiss" data-f="dismiss" aria-label="Dismiss">×</button>
+  </div>
+</template>
+
+<template id="tpl-badge">
+  <span class="badge"></span>
+</template>
+
+<!-- ES modules loaded straight by the browser: zero dependencies, no bundler, no build
+     step. The ?v= query is bumped whenever the API contract changes so a stale cached
+     module can never be paired with a new payload shape. Every module app.js imports
+     carries the same marker. -->
+<script type="module" src="./app.js?v=1"></script>
+
+</body>
+</html>

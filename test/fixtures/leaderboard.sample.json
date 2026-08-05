@@ -1,0 +1,100 @@
+{
+  "_readme": "FROZEN CONTRACT. public/ is built against this exact object and the server is tested to produce it. Changing any invariant here rewrites public/render.js -- see docs/SPEC.md.",
+  "schema": 1,
+  "competition": {
+    "start": "2026-06-01",
+    "end": "2026-08-31",
+    "state": "open",
+    "today": "2026-08-04",
+    "days_remaining": 28,
+    "timezone": "UTC",
+    "allowed_sport_types": ["Ride", "GravelRide", "MountainBikeRide", "VirtualRide"],
+    "manual_rides_counted": false
+  },
+  "units": { "distance": "mi" },
+  "teams": [
+    { "team": "EAST", "label": "East", "miles": 1423.7, "ride_count": 88, "rider_count": 6, "moving_seconds": 386400, "share": 0.542 },
+    { "team": "WEST", "label": "West", "miles": 1202.4, "ride_count": 75, "rider_count": 5, "moving_seconds": 331200, "share": 0.458 }
+  ],
+  "totals": { "miles": 2626.1, "ride_count": 163, "rider_count": 11 },
+  "leader": { "team": "EAST", "margin_miles": 221.3 },
+  "riders": [
+    {
+      "rank": 1,
+      "athlete_id": 12345678,
+      "display_name": "Julien C.",
+      "avatar_url": "https://dgalywyr863hv.cloudfront.net/pictures/athletes/12345678/1/large.jpg",
+      "profile_url": "https://www.strava.com/athletes/12345678",
+      "team": "EAST",
+      "miles": 412.8,
+      "ride_count": 19,
+      "longest_ride_miles": 78.2,
+      "moving_seconds": 92400,
+      "private_rides_counted": true,
+      "revoked": false,
+      "last_synced_at": "2026-08-04T18:22:01.000Z",
+      "is_you": true
+    },
+    {
+      "rank": 2,
+      "athlete_id": 22222222,
+      "display_name": "Dana W.",
+      "avatar_url": null,
+      "profile_url": "https://www.strava.com/athletes/22222222",
+      "team": "WEST",
+      "miles": 388.1,
+      "ride_count": 22,
+      "longest_ride_miles": 54.0,
+      "moving_seconds": 88000,
+      "private_rides_counted": false,
+      "revoked": false,
+      "last_synced_at": "2026-08-04T17:05:44.000Z",
+      "is_you": false
+    },
+    {
+      "rank": 3,
+      "athlete_id": 33333333,
+      "display_name": "Sam O.",
+      "avatar_url": null,
+      "profile_url": "https://www.strava.com/athletes/33333333",
+      "team": "EAST",
+      "miles": 388.1,
+      "ride_count": 14,
+      "longest_ride_miles": 61.3,
+      "moving_seconds": 71000,
+      "private_rides_counted": true,
+      "revoked": true,
+      "last_synced_at": "2026-07-28T09:12:00.000Z",
+      "is_you": false
+    },
+    {
+      "rank": null,
+      "athlete_id": 44444444,
+      "display_name": "Priya R.",
+      "avatar_url": null,
+      "profile_url": "https://www.strava.com/athletes/44444444",
+      "team": "WEST",
+      "miles": 0,
+      "ride_count": 0,
+      "longest_ride_miles": 0,
+      "moving_seconds": 0,
+      "private_rides_counted": true,
+      "revoked": false,
+      "last_synced_at": null,
+      "is_you": false
+    }
+  ],
+  "sync": { "last_synced_at": "2026-08-04T18:22:01.000Z", "riders_never_synced": 2 },
+  "generated_at": "2026-08-04T19:52:00.000Z",
+  "_invariants": [
+    "teams is ALWAYS exactly two entries in EAST-then-WEST order, even at zero miles.",
+    "share is precomputed and both are 0.5 when totals.miles is 0.",
+    "leader is null on an exact tie; margin_miles is never negative.",
+    "Riders with a team and zero counted rides ARE included, with miles 0 and rank null (rendered as an em-dash). Zero-mile ties are the common case on day one, so a numeric rank there would be signup order dressed up as a ranking.",
+    "Rank 2 and 3 above are a genuine tie at 388.1: the tiebreak is ride_count DESC, then display_name ASC, then athlete_id ASC. Ranks stay distinct.",
+    "Riders who never picked a team are excluded entirely.",
+    "avatar_url and profile_url are absolute https: URLs or null -- Strava returns the bare relative string 'avatar/athlete/large.png' for photo-less athletes, so the server normalizes that to null.",
+    "All distances are Numbers in miles already rounded to 1dp. The client never divides by 1609.344.",
+    "is_you is set server-side from the session, never inferred by the client."
+  ]
+}

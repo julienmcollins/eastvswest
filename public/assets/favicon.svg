@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ours, not a Strava asset. Two wheels, east and west. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="Bike competition">
+  <rect width="32" height="32" rx="7" fill="#22262C"/>
+  <circle cx="11" cy="20" r="6" fill="none" stroke="#5B8DEF" stroke-width="2.5"/>
+  <circle cx="23" cy="20" r="6" fill="none" stroke="#B07CF0" stroke-width="2.5"/>
+  <path d="M11 20 16 9h4" fill="none" stroke="#E7E9EE" stroke-width="2" stroke-linecap="round"/>
+  <path d="M16 9 23 20" fill="none" stroke="#E7E9EE" stroke-width="2" stroke-linecap="round"/>
+</svg>
