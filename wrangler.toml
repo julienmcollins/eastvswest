@@ -27,7 +27,7 @@ workers_dev = true
 [[d1_databases]]
 binding = "DB"                    # server/db/d1.js reads env.DB
 database_name = "bike-comp"
-database_id = "REPLACE_WITH_THE_ID_FROM_wrangler_d1_create"
+database_id = "bfdeba95-f276-4272-b1b4-0047b789609d"
 # NOT OPTIONAL. wrangler defaults this to `./migrations` relative to this file, and this
 # project keeps them under server/. Without it, `wrangler d1 migrations apply` fails with
 # "no migrations present at <root>/migrations" and no hint that the folder simply moved.
