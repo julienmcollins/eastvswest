@@ -266,14 +266,79 @@ test('computeSyncWindow incremental starts at the watermark, clamped to the comp
   assert.equal(zero.afterEpoch, epochAtStartOfDate('2026-06-01') - 86400);
 });
 
-test('computeSyncWindow never asks past the competition end nor into the future', () => {
-  const config = testConfig();
-  const afterEnd = computeSyncWindow(config, { mode: 'full', nowMs: Date.parse('2027-01-01T00:00:00Z') });
-  assert.equal(afterEnd.beforeEpoch, epochAtEndOfDate('2026-08-31') + 86400);
+test('computeSyncWindow never asks beyond now, and always covers the configured range', () => {
+  const config = testConfig(); // 2026-06-01 .. 2026-08-31
+  const PAD = 86400;
 
-  // Before the competition opens the naive window inverts; it must stay non-empty.
-  const early = computeSyncWindow(config, { mode: 'full', nowMs: Date.parse('2026-01-01T00:00:00Z') });
+  // Well AFTER the configured competition. `before` is bounded by now + the pad, never by the
+  // far end of the range -- which now reaches the current month, so an unbounded `before`
+  // would ask Strava for months that cannot exist yet.
+  const lateNow = Date.parse('2027-01-01T00:00:00Z');
+  const late = computeSyncWindow(config, { mode: 'full', nowMs: lateNow });
+  assert.equal(late.beforeEpoch, Math.floor(lateNow / 1000) + PAD);
+  assert.ok(late.afterEpoch <= epochAtStartOfDate('2026-06-01'), 'the configured start stays covered');
+
+  // Well BEFORE it: the window must stay non-empty, and `after` must not be in the future --
+  // Strava rejects a future `after` outright with 400 {after: future}, so getting this wrong
+  // makes every sync a 502 rather than an empty result.
+  const earlyNow = Date.parse('2026-01-01T00:00:00Z');
+  const early = computeSyncWindow(config, { mode: 'full', nowMs: earlyNow });
   assert.ok(early.beforeEpoch > early.afterEpoch, `${early.beforeEpoch} > ${early.afterEpoch}`);
+  assert.ok(early.afterEpoch <= Math.floor(earlyNow / 1000), 'after must never be in the future');
+  // January is the current month at that instant, so it is inside the window too.
+  assert.ok(early.afterEpoch <= epochAtStartOfDate('2026-01-01'), 'the current month is covered');
+});
+
+test('computeSyncWindow always fetches the CURRENT month, even when the competition has not begun', () => {
+  // The bug this pins down shipped and was reported as "it is not showing any of my data".
+  // With COMPETITION_START/END set to a month still in the future, the configured range is
+  // entirely ahead of `now`, `after` gets clamped to now, and the window collapses to
+  // "between now and tomorrow": every sync answers `ok` and stores nothing, for weeks, with
+  // no error anywhere. The current month must be inside the fetched range unconditionally.
+  const config = testConfig({ COMPETITION_START: '2026-09-01', COMPETITION_END: '2026-09-30' });
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const nowSeconds = Math.floor(nowMs / 1000);
+
+  for (const mode of ['full', 'incremental']) {
+    const w = computeSyncWindow(config, { mode, nowMs });
+    // All of August so far has to be inside [after, before].
+    assert.ok(w.afterEpoch <= epochAtStartOfDate('2026-08-01'), `${mode}: August 1 is not covered`);
+    assert.ok(w.beforeEpoch >= nowSeconds, `${mode}: today is not covered`);
+    // And the invariant that made this fail loudly before it failed silently.
+    assert.ok(w.afterEpoch <= nowSeconds, `${mode}: after must never be in the future`);
+    // A ride uploaded this morning must fall inside the window.
+    const thisMorning = Math.floor(Date.parse('2026-08-05T08:00:00Z') / 1000);
+    assert.ok(
+      thisMorning > w.afterEpoch && thisMorning < w.beforeEpoch,
+      `${mode}: a ride from this morning is outside the fetch window`,
+    );
+  }
+
+  // A competition entirely in the PAST must still pick up the current month, for the same
+  // reason: the picker offers it, so it has to be fetchable.
+  const past = testConfig({ COMPETITION_START: '2026-01-01', COMPETITION_END: '2026-01-31' });
+  const w = computeSyncWindow(past, { mode: 'full', nowMs });
+  assert.ok(w.afterEpoch <= epochAtStartOfDate('2026-01-01'), 'the configured month stays covered');
+  assert.ok(w.beforeEpoch >= nowSeconds, 'the current month is covered too');
+});
+
+test('computeSyncWindow never sends a future `after`, whenever "now" falls', () => {
+  // The competition is 2026-06-01..2026-08-31; walk from well before it to well after.
+  const config = testConfig();
+  for (const today of ['2025-01-01', '2026-05-30', '2026-05-31', '2026-06-01', '2026-07-15', '2026-08-31', '2027-06-01']) {
+    const nowMs = Date.parse(`${today}T12:00:00Z`);
+    const nowSeconds = Math.floor(nowMs / 1000);
+    for (const mode of ['full', 'incremental']) {
+      // A watermark in the future is not reachable in normal operation, but the clamp is
+      // what keeps a corrupted one from poisoning every subsequent sync with a 400.
+      for (const watermarkEpoch of [0, nowSeconds - 60, nowSeconds + 30 * 86400]) {
+        const w = computeSyncWindow(config, { mode, watermarkEpoch, nowMs });
+        assert.ok(w.afterEpoch <= nowSeconds, `${mode} @${today} wm=${watermarkEpoch}: after ${w.afterEpoch} > now ${nowSeconds}`);
+        assert.ok(w.beforeEpoch > w.afterEpoch, `${mode} @${today} wm=${watermarkEpoch}: window inverted`);
+        assert.ok(w.afterEpoch >= 0, `${mode} @${today}: negative after`);
+      }
+    }
+  }
 });
 
 test('computeSyncWindow rejects a bogus mode', () => {

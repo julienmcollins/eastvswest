@@ -1,7 +1,7 @@
 import { ERROR_CODES } from '../contracts.js';
 import { HttpError } from '../http/respond.js';
 import { log } from '../lib/log.js';
-import { isoUtcNow, resolveWindow } from '../lib/dates.js';
+import { isoUtcNow, startOfMonth, endOfMonth } from '../lib/dates.js';
 import { getAthlete as getAthleteRow, upsertAthleteFromStrava } from '../db/athletes.js';
 import { reconcileDeletions, upsertActivities } from '../db/activities.js';
 import {
@@ -409,25 +409,35 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
 }
 
 /**
- * How many of the rides we just stored will actually show on the leaderboard.
+ * How many of the rides we just stored can show on SOME month's leaderboard.
  *
- * The same three tests the SQL predicate applies -- sport type, local date inside the
- * competition, and the manual policy -- so the number the rider sees after a sync agrees with
- * the number on the board. `local_date` comes from `start_date_local` (a wall clock with a
- * bogus Z), never from the UTC instant, which is what keeps the Auckland 00:30-local ride on
- * the right day.
+ * Not "on the board", because there is no single board any more: every calendar month is its own
+ * competition, and this one number is reported for a sync that serves all of them. So the date
+ * test is against the whole CONFIGURED range (first configured month .. last configured month)
+ * rather than one month -- a June ride the rider will see when they pick June is genuinely
+ * countable, and reporting 0 for it because the reader happens to be looking at August would make
+ * the post-sync line read as a failed sync.
  *
- * One known, deliberate discrepancy: an admin-APPROVED manual ride counts on the board but
- * not here, because `manual_approved` is admin state that this run never read. It affects a
- * per-run diagnostic number only, never a total.
+ * The other two tests are the same ones the SQL predicate applies -- sport type and the
+ * manual policy -- so a ride this counts is a ride the board will count. `local_date` comes
+ * from `start_date_local` (a wall clock with a bogus Z), never from the UTC instant, which is
+ * what keeps the Auckland 00:30-local ride on the right day and therefore in the right month.
+ *
+ * Two known, deliberate discrepancies, both affecting this per-run diagnostic number only and
+ * never a total. An admin-APPROVED manual ride counts on the board but not here, because
+ * `manual_approved` is admin state this run never read. And a ride landing just outside the
+ * configured months -- the fetch window is padded a day on each end -- is not counted here even
+ * though the picker DOES now offer its month; counting it would mean re-querying the widened
+ * bounds from the database to move one log field.
  */
 function countCountable(config, rows) {
-  const window = resolveWindow(config, {});
+  const lo = startOfMonth(config.competitionFirstMonth);
+  const hi = endOfMonth(config.competitionLastMonth);
   let counted = 0;
   for (const row of rows) {
     if (!isCountedSportType(row.sport_type, config.allowedSportTypes)) continue;
     const localDate = localDateOf(row.start_date_local);
-    if (localDate < window.start || localDate > window.end) continue;
+    if (localDate < lo || localDate > hi) continue;
     if (row.is_manual === 1 && !config.countManualActivities) continue;
     counted += 1;
   }

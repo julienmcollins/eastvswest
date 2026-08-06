@@ -9,6 +9,7 @@ import { HttpError, sendJson, sendError, sendRedirect, sendNoContent } from '../
 import { readJsonBody } from '../server/http/body.js';
 import { parseCookies, serializeCookie, clearCookie } from '../server/http/cookies.js';
 import { corsHeaders } from '../server/http/cors.js';
+import { API_SCHEMA } from '../server/contracts.js';
 import { redact, SENSITIVE_KEYS } from '../server/security/redact.js';
 import { log, setLogSink } from '../server/lib/log.js';
 import { injectRequest, attrOf } from './helpers/inject.js';
@@ -145,7 +146,9 @@ test('routes: null still serves GET /api/health', async () => {
   const res = await injectRequest(app, { url: '/api/health' });
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
-  assert.equal(res.json.schema, 1);
+  // API_SCHEMA, not a literal: /api/health reports the wire version, so a hardcoded 1 here
+  // fails every time the contract legitimately bumps.
+  assert.equal(res.json.schema, API_SCHEMA);
   assert.match(res.json.time, /Z$/);
 });
 

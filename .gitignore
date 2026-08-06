@@ -15,3 +15,9 @@ coverage/
 *.log
 tmp/
 probe-output.json
+
+# Wrangler's local state and its dev-mode SQLite. `wrangler.toml` itself is deliberately NOT
+# ignored -- it is meant to be committed, which is exactly why the three secrets go through
+# `wrangler secret put` instead of living in it. See docs/DEPLOY.md.
+.wrangler/
+.dev.vars

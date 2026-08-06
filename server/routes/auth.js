@@ -22,6 +22,11 @@ import { epochSeconds } from '../lib/dates.js';
  * as a raw blob of text in a tab the rider cannot act on. The fragment is read by
  * public/app.js and turned into a banner. (A fragment rather than a query parameter because
  * fragments are never sent to a server, a proxy, or a CDN log.)
+ *
+ * SUCCESS uses the same fragment channel for the same reason when
+ * `AUTH_TOKEN_IN_FRAGMENT` is on: `#token=<session token>` is the only way to hand a
+ * credential to a frontend on a different registrable domain, where the cookie below is
+ * dropped by the browser. See docs/DEPLOY.md "Default hosts".
  */
 
 /**
@@ -119,7 +124,10 @@ export function registerAuthRoutes(router, { config, db, strava, now }) {
     /** Every failure exit. Never JSON -- see the file header. */
     const fail = (fragment, reason) => {
       ctx.log?.warn?.('oauth callback rejected', { fragment, reason });
-      sendRedirect(res, `${config.webOrigin}/#error=${fragment}`, { 'Set-Cookie': clearOauth });
+      // webAppUrl, not webOrigin: on a Pages project site the app lives at
+      // `user.github.io/<repo>/` and the origin root is GitHub's own 404 page, which would
+      // swallow the error fragment and show the rider nothing at all.
+      sendRedirect(res, `${config.webAppUrl}/#error=${fragment}`, { 'Set-Cookie': clearOauth });
     };
 
     // --- 2. The rider said no on Strava's consent screen. ---
@@ -261,7 +269,27 @@ export function registerAuthRoutes(router, { config, db, strava, now }) {
     // Workers without ctx.waitUntil(), so a new rider lands on a permanently empty board
     // with nothing logged anywhere. public/ calls POST /api/me/sync once after login and the
     // 60 s cooldown makes that safe and idempotent.
-    sendRedirect(res, `${config.webOrigin}${safeReturnTo(config, consumed.returnTo)}`, {
+    //
+    // `safeReturnTo` already resolved to a path INSIDE config.webBasePath, so this lands on
+    // the app even on a Pages project site.
+    const returnTo = safeReturnTo(config, consumed.returnTo);
+
+    /**
+     * The bearer handoff, empty unless AUTH_TOKEN_IN_FRAGMENT is on.
+     *
+     * A FRAGMENT, never a query parameter: fragments are never sent to a server, a proxy, or
+     * a CDN log, and this is a live session credential. public/app.js reads it exactly once in
+     * consumeAuthFragment() and scrubs the URL with a single history.replaceState.
+     *
+     * The cookies below are still set on this path. They are simply dropped by the browser
+     * when the API is cross-site, and setting them anyway means one code path serves both
+     * deployments -- and that a shared-domain deploy keeps working if the flag is left on.
+     */
+    const tokenFragment = config.authTokenInFragment
+      ? `#token=${encodeURIComponent(session.rawToken)}`
+      : '';
+
+    sendRedirect(res, `${config.webOrigin}${returnTo}${tokenFragment}`, {
       'Set-Cookie': [
         clearOauth,
         serializeCookie(COOKIES.SESSION, session.rawToken, sessionCookieOptions(config)),

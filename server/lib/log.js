@@ -49,8 +49,19 @@ function emit(level, msg, fields, bound) {
     // is ever reached, losing the log line must not take the request down with it.
     line = `${JSON.stringify({ ts: record.ts, level: 'error', msg: 'log serialization failed', reason: String(err) })}\n`;
   }
-  if (level === 'info') process.stdout.write(line);
-  else process.stderr.write(line);
+  // `process.stdout` is a Node concept. On Cloudflare Workers it is absent (or a stub with no
+  // `write`) depending on the compatibility date, and an unguarded `.write` there throws
+  // inside the logger -- which turns a log line into a 500 on a request that had already
+  // succeeded. console.* is what the Workers runtime forwards to `wrangler tail`, so it is the
+  // correct sink there, and the trailing newline is dropped because console adds one.
+  const stream = level === 'info' ? process?.stdout : process?.stderr;
+  if (typeof stream?.write === 'function') {
+    stream.write(line);
+  } else if (level === 'info') {
+    console.log(line.trimEnd());
+  } else {
+    console.error(line.trimEnd());
+  }
 }
 
 function createLogger(bound = {}) {

@@ -1,7 +1,24 @@
 /*
- * bike-comp — East vs West leaderboard.
+ * bike-comp — East vs West leaderboard.  RETRO 8-BIT / PIXEL-ART SKIN.
  *
  * Zero dependencies, no build step, no preprocessor. Plain CSS loaded directly.
+ *
+ * NO WEB FONTS, DELIBERATELY. The page ships `default-src 'none'` (see the <meta> CSP in
+ * index.html and buildCsp in server/http/static.js) and does NOT declare `font-src`, so
+ * font-src falls back to 'none' and EVERY @font-face download is blocked — including a
+ * self-hosted one. Adding an @font-face here would silently fail and fall back to the
+ * next family in the stack, so the pixel look is built from a chunky system MONOSPACE
+ * stack plus hard-edged CSS geometry instead. Do not add @font-face or any font URL.
+ *
+ * Pixel-art house rules, applied everywhere below:
+ *   - border-radius: 0. Hard edges only. --radius/--radius-sm are kept as tokens, pinned
+ *     to 0, so any stray rule that still references them cannot round a corner.
+ *   - Chunky solid borders (--bw / --bw-lg) and hard OFFSET shadows with zero blur
+ *     (--shadow / --shadow-sm), for stepped, blocky depth.
+ *   - Limited, saturated palette, expressed only through the custom properties below.
+ *   - Uppercase, letter-spaced headings and controls.
+ *   - Progress/split bar drawn as DISCRETE CHUNKS (repeating-linear-gradient with hard
+ *     colour stops), never a smooth gradient.
  *
  * Theming rules, both load-bearing:
  *   1. `color-scheme: light dark` on :root, so form controls, scrollbars and the <dialog>
@@ -12,99 +29,206 @@
  *      loses every border.
  *
  * The "Connect with Strava" button is an <img> and gets ONLY box sizing here. It must
- * never be recoloured, filtered, re-rounded or otherwise restyled — that is a term of the
- * Strava API Agreement, not a preference. Same for "Powered by Strava".
+ * never be recoloured, filtered, re-rounded, resized or otherwise restyled — that is a
+ * term of the Strava API Agreement, not a preference. In particular it must NOT get
+ * `image-rendering: pixelated`; that property is scoped to .avatar only. Same for
+ * "Powered by Strava".
  */
 
 :root {
   color-scheme: light dark;
 
-  /* Light theme */
-  --bg: #f4f5f7;
-  --surface: #fbfbfc;
-  --surface-2: #eef0f3;
-  --text: #1b1f24;
-  --text-muted: #5c636d;
-  --border: #d8dce2;
-  --border-strong: #b9c0c9;
+  /* Light theme — warm "manual/box-art" paper with ink outlines. */
+  --bg: #e6e2d3;
+  --bg-dither: #dcd7c4;
+  --surface: #f6f2e2;
+  --surface-2: #d8d3c0;
+  --text: #1a1a2e;
+  --text-muted: #4a4a63;
+  --border: #a49b83;
+  --border-strong: #12121c;
+  --shadow-color: #12121c;
 
-  --east: #3b6fd4;
-  --east-soft: #dce6fa;
-  --west: #8b5cf6;
-  --west-soft: #e8dffd;
+  --east: #1247b8;
+  --east-soft: #bcd3ff;
+  --west: #7a1fa2;
+  --west-soft: #e6c9ff;
 
-  --accent: #1b6f4a;
-  --warn: #8a5a00;
-  --warn-soft: #fdf3dd;
-  --danger: #a32020;
-  --danger-soft: #fbe4e4;
-  --info-soft: #e3ecfa;
+  --accent: #0b6533;
+  --warn: #7a4a00;
+  --warn-soft: #ffe08a;
+  --danger: #a1102a;
+  --danger-soft: #ffc9c9;
+  --info-soft: #cfe3ff;
+
+  /* Focus ring colour. Deliberately NOT a team colour: it has to stay obvious on every
+     tinted surface (east-soft, west-soft, warn-soft, danger-soft) in both themes. */
+  --focus-ring: #10101a;
 
   /* Strava orange. Present only for the placeholder assets' documentation value; no
      element in this stylesheet paints with it, because the brand assets are images. */
   --strava: #fc5200;
 
-  --radius: 10px;
-  --radius-sm: 6px;
-  --shadow: 0 1px 2px rgb(16 18 21 / 8%), 0 4px 16px rgb(16 18 21 / 6%);
-  --focus: 0 0 0 3px rgb(59 111 212 / 45%);
+  /* Hard edges only — see the house rules above. */
+  --radius: 0;
+  --radius-sm: 0;
 
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-num: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Pixel geometry. One place to make the whole page chunkier or thinner. */
+  --bw: 3px;
+  --bw-lg: 4px;
+  --shadow: var(--bw-lg) var(--bw-lg) 0 0 var(--shadow-color);
+  --shadow-sm: var(--bw) var(--bw) 0 0 var(--shadow-color);
+  --shadow-lg: 6px 6px 0 0 var(--shadow-color);
+
+  /*
+   * Spacing scale. ONE 4px-based ladder for every margin, gap and block padding on the
+   * page, so the vertical rhythm cannot drift a rule at a time (it already had: 0.1, 0.15,
+   * 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.75, 1, 1.25, 1.5 and 2rem were all in use).
+   *
+   *   --sp-05   2px  micro rhythm INSIDE a card (label -> number -> subline)
+   *   --sp-1    4px  tightest gap between two related inline things
+   *   --sp-2    8px  default gap between sibling controls, and between stacked text lines
+   *   --sp-3   12px  inner gutter of a bordered block; also the shadow-clearance step
+   *   --sp-4   16px  gap between the columns/rows of a region, and inside the team dialog
+   *   --sp-5   20px  gap between stacked top-level blocks, and their inner gutter
+   *   --sp-8   32px  the largest step: page gutter at wide widths, the break before the footer
+   *
+   * SHADOW CLEARANCE: the hard offset shadows above sit OUTSIDE the box but contribute
+   * nothing to layout, so a gap smaller than the offset lets the next element sit on top of
+   * the shadow. The largest offset is 6px (--shadow-lg), so any gap of --sp-3 or more clears
+   * every shadow in this file — that is the reason blocks that carry a shadow are never
+   * separated by less than --sp-3.
+   *
+   * NOT on this ladder, deliberately: the padding inside controls (button/.btn/.btn-sm) and
+   * inside inline pills (.chip, .badge, .you-tag, .window-status, .vs). Those are type
+   * metrics tuned to the font's cap height, not space between elements, and rounding them
+   * to 4px steps changes the shape of every control on the page.
+   */
+  --sp-05: 0.125rem;
+  --sp-1: 0.25rem;
+  --sp-2: 0.5rem;
+  --sp-3: 0.75rem;
+  --sp-4: 1rem;
+  --sp-5: 1.25rem;
+  --sp-8: 2rem;
+
+  /* Chunky monospace stack. Monospace is the pixel-art proxy that every OS already has
+     installed; see the NO WEB FONTS note at the top of this file. */
+  --font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+  --font-num: var(--font);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #14171c;
-    --surface: #1b1f25;
-    --surface-2: #23282f;
-    --text: #e8eaee;
-    --text-muted: #a2aab5;
-    --border: #2f353d;
-    --border-strong: #414954;
+    --bg: #12162a;
+    --bg-dither: #1a1f30;
+    --surface: #1e2338;
+    --surface-2: #2c3454;
+    --text: #f2f3ef;
+    --text-muted: #a9b2c9;
+    --border: #414a6b;
+    /* Outlines invert in dark mode: the chunky border is the LIGHT edge, and the hard
+       offset shadow is a dimmer second edge, so blocky depth still reads on a dark bg
+       (a near-black drop shadow would be invisible here). */
+    --border-strong: #8b95bd;
+    --shadow-color: #454f78;
 
-    --east: #6f9bf2;
-    --east-soft: #22314d;
-    --west: #b592fb;
-    --west-soft: #2e2549;
+    --east: #58a6ff;
+    --east-soft: #16305c;
+    --west: #c98bff;
+    --west-soft: #351a5c;
 
-    --accent: #58c08d;
-    --warn: #e5b562;
-    --warn-soft: #33290f;
-    --danger: #f08a8a;
-    --danger-soft: #3a1d1d;
-    --info-soft: #1e2836;
+    --accent: #5ce08a;
+    --warn: #ffcc4d;
+    --warn-soft: #3a2a05;
+    --danger: #ff8f8f;
+    --danger-soft: #4a1414;
+    --info-soft: #17243c;
 
-    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 6px 20px rgb(0 0 0 / 30%);
-    --focus: 0 0 0 3px rgb(111 155 242 / 50%);
+    --focus-ring: #ffd84d;
   }
 }
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/*
+ * ============================================================================
+ * THE `hidden` ATTRIBUTE BACKSTOP. Do not remove, do not weaken.
+ * ============================================================================
+ * render.js hides and shows things with `setVisible(el, visible) { el.hidden = !visible }`
+ * and nothing else. That leans entirely on the user-agent rule `[hidden] { display: none }`
+ * — which is an AUTHOR-OVERRIDABLE default. Any author rule that sets `display` on the
+ * same element wins on cascade origin alone, no matter how weak its selector: before this
+ * rule existed, `.strava-connect { display: inline-flex }` beat it and the "Connect with
+ * Strava" button STAYED VISIBLE after sign-in. The same latent bug applied to every other
+ * setVisible target: #btn-refresh, #btn-logout, #btn-pick-team, #btn-reconnect, #viewer,
+ * #empty-state, #roster, #roster-empty, .you-tag and .banner-action.
+ *
+ * The `!important` is the load-bearing part: several rules below legitimately need
+ * `display: flex/inline-flex` on elements that are ALSO setVisible targets, and an
+ * important declaration is the only thing that survives them regardless of specificity or
+ * source order. No other rule in this file marks `display` as important, so this always
+ * wins. If you ever add `display: … !important` somewhere else, re-check every
+ * setVisible() call in render.js first.
+ */
+[hidden] { display: none !important; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0 auto;
-  padding: clamp(0.75rem, 2vw, 2rem);
+  /* Also the shadow gutter: every hard shadow below is offset by at most 6px, so this
+     padding keeps them inside the viewport and there is no horizontal overflow. */
+  padding: clamp(var(--sp-3), 2vw, var(--sp-8));
   max-width: 62rem;
-  background: var(--bg);
+  background-color: var(--bg);
+  /* Static 8-bit dither. No animation, and the two tones are one step apart so text
+     contrast on top of it is unchanged. */
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--bg-dither) 0 2px,
+    transparent 2px 8px
+  );
   color: var(--text);
   font-family: var(--font);
   font-size: 16px;
   line-height: 1.5;
 }
 
-h1, h2, h3 { line-height: 1.2; margin: 0; }
-
-:where(a) { color: var(--east); }
-:where(a:focus-visible), :where(button:focus-visible) {
-  outline: none;
-  box-shadow: var(--focus);
-  border-radius: var(--radius-sm);
+h1, h2, h3 {
+  line-height: 1.2;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
 }
 
-.muted { color: var(--text-muted); font-size: 0.875rem; }
+/*
+ * A heading and the copy under it. h1/h2/h3 ship with `margin: 0` above so each container
+ * owns its own rhythm — which means every block with a visible heading has to restate this
+ * one gap, and they had drifted: .roster set 0.5rem on the <h2>, .empty-state set 0.6rem on
+ * the <p> instead, and .team-dialog set neither, so its heading sat flush against the
+ * sentence below it (h2 margin-bottom 0 meeting `p { margin-top: 0 }` = a 0px gap). One rule
+ * for all three instead of three near-miss values.
+ */
+:is(.empty-state, .roster, .team-dialog) > h2 { margin-bottom: var(--sp-2); }
+
+p { margin: 0 0 var(--sp-2); }
+p:last-child { margin-bottom: 0; }
+
+:where(a) { color: var(--east); }
+
+/* Focus rings are a hard pixel outline, never removed. `outline` rather than a box-shadow
+   ring on purpose: the hard offset shadows below are box-shadows, and a focus box-shadow
+   would replace them and make focused controls visibly "drop" a layer. */
+:where(a, button, select, input, textarea, summary, [tabindex]):focus-visible {
+  outline: var(--bw) solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 0;
+}
+
+.muted { color: var(--text-muted); font-size: 0.8125rem; }
 
 .visually-hidden {
   position: absolute;
@@ -116,288 +240,674 @@ h1, h2, h3 { line-height: 1.2; margin: 0; }
   border: 0;
 }
 
+/* -------------------------------------------------------------- form controls ---- */
+/*
+ * Bare-element styling, on purpose. A control that is added later (e.g. the month
+ * picker's <select> and its prev/next buttons) picks up the pixel-art look without
+ * needing to know a class name; `.btn` below then re-states the same box because it also
+ * has to dress an <a> (#btn-reconnect), which no element selector here can reach.
+ */
+
+button, select, input, textarea, option {
+  font: inherit;
+  color: var(--text);
+  border-radius: 0;
+}
+
+button, select, input:not([type="checkbox"]):not([type="radio"]), textarea, .btn {
+  background: var(--surface);
+  border: var(--bw) solid var(--border-strong);
+  padding: 0.4rem 0.6rem;
+  max-width: 100%;
+  box-shadow: var(--shadow-sm);
+}
+
+button, select, .btn {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+/* Native select chrome is rounded and OS-shaped, so it is replaced with a hard-edged
+   chevron drawn from two hard-stop gradients (no image request, CSP-safe). */
+select {
+  appearance: none;
+  padding-right: 1.9rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 1.05rem) 55%, calc(100% - 0.6rem) 55%;
+  background-size: 0.45rem 0.45rem, 0.45rem 0.45rem;
+  background-repeat: no-repeat;
+}
+
+option { background: var(--surface); }
+
+label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+/* Scoped away from .btn: a flat `background-color` here would wipe the east/west/warn
+   tints that the .btn-* variants depend on. .btn gets a lift instead, below. */
+button:not(.btn):hover:not(:disabled), select:hover:not(:disabled) {
+  background-color: var(--surface-2);
+}
+
+/* Blocky press: the control steps down into its own shadow. Instant, no transition, so
+   there is nothing here for prefers-reduced-motion to suppress. */
+button:active:not(:disabled), .btn:active:not(:disabled) {
+  transform: translate(var(--bw), var(--bw));
+  box-shadow: none;
+}
+
+button:disabled, select:disabled, input:disabled, .btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+  box-shadow: none;
+  transform: none;
+}
+
+.btn {
+  /* Setting `display` here is safe ONLY because of the [hidden] backstop near the top of
+     this file: #btn-refresh, #btn-logout, #btn-pick-team, #btn-reconnect and
+     .banner-action are all setVisible targets that carry this class. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  padding: 0.45rem 0.8rem;
+  text-decoration: none;
+  text-align: center;
+}
+/* The variants keep their fill on hover; depth deepens by one pixel step instead. */
+.btn:hover:not(:disabled) { box-shadow: var(--shadow); transform: translate(-1px, -1px); }
+.btn.is-pending { cursor: progress; }
+.btn-sm { padding: 0.25rem 0.5rem; font-size: 0.6875rem; }
+.btn-quiet { background: transparent; border-color: var(--border); color: var(--text-muted); }
+.btn-primary { border-color: var(--east); color: var(--east); background: var(--east-soft); }
+.btn-warn { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); }
+
+/*
+ * Syncing: a marching hard-edged barber pole, four discrete steps, no blur.
+ *
+ * NOT written as `:not(:disabled)`: setRefreshPending() in render.js sets `disabled = true`
+ * AND `aria-busy`/`.is-pending` together, so a :not(:disabled) guard would mean the busy
+ * state never renders at all. `opacity: 1` is re-stated for the same reason — the generic
+ * :disabled dim would drop the "Syncing…" label below AA contrast.
+ */
+.btn.is-pending, .btn[aria-busy="true"] {
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--surface-2) 0 6px,
+    transparent 6px 12px
+  );
+  animation: pixel-march 640ms steps(4, end) infinite;
+  opacity: 1;
+  cursor: progress;
+}
+
+/* 17px, not 12px: the pattern's period is measured perpendicular to a 45deg band, so one
+   full cycle along the x axis is 12 / cos(45deg) ≈ 17px. A round 12px would visibly jump. */
+@keyframes pixel-march {
+  from { background-position: 0 0; }
+  to { background-position: 17px 0; }
+}
+
+/*
+ * Box sizing ONLY, plus spacing and a focus/hover ring OUTSIDE the graphic. Do not add
+ * background, filter, transform, opacity, image-rendering, border-radius or any colour
+ * that lands on the <img>: the official Strava button must render unmodified. The
+ * previous `:hover { opacity }` was removed for exactly that reason — an outline changes
+ * nothing inside the button's own box.
+ */
+.strava-connect { display: inline-flex; line-height: 0; }
+.strava-connect img { width: 193px; height: 48px; }
+.strava-connect:hover, .strava-connect:focus-visible {
+  outline: var(--bw) solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
 /* ------------------------------------------------------------------- masthead ---- */
 
 .masthead {
   display: flex;
   flex-wrap: wrap;
-  gap: 1rem;
+  gap: var(--sp-4);
   align-items: flex-start;
   justify-content: space-between;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid var(--border);
+  padding-bottom: var(--sp-4);
+  border-bottom: var(--bw) dashed var(--border-strong);
 }
 
-.masthead h1 { font-size: clamp(1.5rem, 4vw, 2rem); letter-spacing: -0.02em; }
-.masthead h1 .vs { color: var(--text-muted); font-weight: 400; }
+.masthead-title { min-width: 0; }
 
-.window { margin: 0.35rem 0 0; font-size: 0.95rem; color: var(--text-muted); }
-.window .dot { opacity: 0.55; margin: 0 0.35rem; }
-.window-status { color: var(--text); font-weight: 600; }
-.window-status[data-state="closed"] { color: var(--text-muted); font-weight: 500; }
-.window-meta { margin: 0.2rem 0 0; font-size: 0.8125rem; color: var(--text-muted); }
+.masthead h1 {
+  font-size: clamp(1.25rem, 5vw, 2rem);
+  letter-spacing: 0.04em;
+  /* Long enough to matter at 320px once letter-spaced. */
+  overflow-wrap: break-word;
+}
+.masthead h1 .vs {
+  display: inline-block;
+  background: var(--border-strong);
+  color: var(--bg);
+  padding: 0 0.25em;
+  font-weight: 700;
+}
 
+.window {
+  margin: var(--sp-2) 0 0;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.window .dot { margin: 0 var(--sp-1); }
+.window-status {
+  color: var(--text);
+  font-weight: 700;
+  border: 2px solid var(--border-strong);
+  background: var(--surface);
+  padding: 0 0.35em;
+}
+.window-status[data-state="open"] { color: var(--accent); border-color: var(--accent); }
+.window-status[data-state="upcoming"] { color: var(--east); border-color: var(--east); }
+.window-status[data-state="closed"] { color: var(--text-muted); border-color: var(--border); }
+
+.window-meta {
+  margin: var(--sp-1) 0 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  overflow-wrap: break-word;
+}
+
+/*
+ * The action cluster. Its contents swap WHOLESALE at sign-in — logged out it holds only the
+ * Strava button, logged in it holds the viewer chip, Refresh, Sign out and (conditionally)
+ * "Pick your team" and "Reconnect Strava", with the Strava button hidden.
+ *
+ * All of that spacing therefore comes from `gap` and NOTHING here may put a margin on a
+ * child: a `gap` reserves no space for a `[hidden]` child, but a margin on the child NEXT to
+ * a hidden one still paints, so a margin tuned in one state leaves a lopsided gap in the
+ * other. Same reason the buttons below are spaced only by this gap.
+ */
 .masthead-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   align-items: center;
 }
 
-.viewer { display: flex; align-items: center; gap: 0.5rem; }
-.viewer-text { display: flex; flex-direction: column; line-height: 1.2; }
-.viewer-name { font-weight: 600; font-size: 0.9rem; }
-
-/* ------------------------------------------------------------------- controls ---- */
-
-.btn {
-  font: inherit;
-  font-weight: 600;
-  font-size: 0.9rem;
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  padding: 0.5rem 0.85rem;
-  cursor: pointer;
+/*
+ * The month picker. Every calendar month is its own competition, so this is primary
+ * navigation and is styled as a solid control cluster rather than a quiet filter.
+ *
+ * `display: flex` here is safe ONLY because of the [hidden] backstop near the top of this
+ * file: #month-picker is a setVisible target (renderMonthPicker hides it when just one month
+ * is selectable), and without that backstop this line would pin it permanently visible --
+ * exactly the bug that kept the Connect button on screen after login.
+ *
+ * Spacing comes off the shared ladder, matching the rest of .masthead-title: --sp-2 between
+ * controls, the same gap .masthead-actions uses for its own button row, and --sp-3 above.
+ * --sp-3 rather than the --sp-1 that separates the two text lines above it, for two reasons:
+ * a control cluster needs more air from running text than two text lines need from each
+ * other, and the prev/next buttons carry --shadow-sm plus a 5px focus ring, neither of which
+ * takes part in layout. (It was 0.5rem/0.4rem, values that appear nowhere else in the file.)
+ */
+.month-picker {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0 0;
+  flex-wrap: wrap;
 }
-.btn:hover:not(:disabled) { background: var(--surface-2); }
-.btn:disabled { cursor: default; opacity: 0.6; }
-.btn.is-pending { cursor: progress; }
-.btn-sm { padding: 0.3rem 0.6rem; font-size: 0.8125rem; }
-.btn-quiet { background: transparent; border-color: var(--border); color: var(--text-muted); }
-.btn-primary { border-color: var(--east); color: var(--east); background: var(--east-soft); }
-.btn-warn { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); text-decoration: none; }
+
+/* The <select> is the widest thing in the cluster — its options read "September 2026 (this
+   month)". `min-width: 0` overrides the flex `min-width: auto`, which would otherwise force
+   the flex line wider than .masthead-title (itself `min-width: 0`) at 320px. Flex line
+   breaking happens before shrinking, so the select still wraps onto its own row at its
+   natural width first; this only stops the extreme case from clipping its neighbours. */
+.month-picker select { min-width: 0; }
+
+/* Uppercase and letter-spaced to match the other headings; not visually-hidden, because a
+   bare pair of arrows either side of a month gives no clue what it steps through. */
+.month-picker-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.viewer {
+  /* Safe under the [hidden] backstop above — #viewer is a setVisible target. */
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border: 2px solid var(--border);
+  background: var(--surface);
+}
+.viewer-text { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+.viewer-name {
+  font-weight: 700;
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+
+/* -------------------------------------------------------------------- banners ---- */
 
 /*
- * Box sizing ONLY. Do not add background, filter, border-radius, or any colour here:
- * the official Strava button must be rendered unmodified.
+ * #banners is always in the DOM and usually EMPTY, so its top margin is the same --sp-5 the
+ * blocks below use: empty, it self-collapses with .scoreboard's margin and the masthead rule
+ * sits --sp-5 above the scoreboard; full, each banner is --sp-5 below that rule. The gap
+ * between banners clears their --shadow-sm.
  */
-.strava-connect { display: inline-flex; line-height: 0; }
-.strava-connect img { width: 193px; height: 48px; }
-.strava-connect:hover { opacity: 0.92; }
-
-/* ------------------------------------------------------------------- banners ---- */
-
-.banners { display: flex; flex-direction: column; gap: 0.5rem; margin: 1rem 0 0; }
+.banners { display: flex; flex-direction: column; gap: var(--sp-3); margin: var(--sp-5) 0 0; }
 
 .banner {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.75rem;
-  padding: 0.6rem 0.8rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: var(--bw) solid var(--border-strong);
   background: var(--info-soft);
-  font-size: 0.9rem;
+  box-shadow: var(--shadow-sm);
+  font-size: 0.8125rem;
+  /* Banner text is --text on a tinted --*-soft fill in both themes: AA at this size. */
+  color: var(--text);
 }
-.banner-text { flex: 1 1 18rem; }
-.banner-warn { background: var(--warn-soft); border-color: var(--warn); }
-.banner-error { background: var(--danger-soft); border-color: var(--danger); }
-.banner-dismiss {
-  font: inherit;
-  font-size: 1.1rem;
-  line-height: 1;
-  background: transparent;
-  border: 0;
-  color: var(--text-muted);
-  cursor: pointer;
-  padding: 0 0.25rem;
-}
+.banner-text { flex: 1 1 16rem; min-width: 0; overflow-wrap: break-word; }
+.banner-info, .banner[data-kind="info"] { background: var(--info-soft); }
+.banner-warn, .banner[data-kind="warn"] { background: var(--warn-soft); border-color: var(--warn); }
+.banner-error, .banner[data-kind="error"] { background: var(--danger-soft); border-color: var(--danger); }
 
-/* ---------------------------------------------------------------- scoreboard ---- */
+.banner-dismiss {
+  flex: 0 0 auto;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  font-size: 1rem;
+  line-height: 1;
+  border: 2px solid var(--border-strong);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+}
+.banner-dismiss:hover:not(:disabled) { background-color: var(--surface-2); }
+.banner-dismiss:active:not(:disabled) { transform: translate(2px, 2px); }
+
+/* ----------------------------------------------------------------- scoreboard ---- */
 
 .scoreboard {
-  margin: 1.25rem 0;
-  padding: clamp(0.9rem, 2vw, 1.4rem);
+  margin: var(--sp-5) 0;
+  padding: clamp(var(--sp-3), 2vw, var(--sp-5));
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: var(--bw-lg) solid var(--border-strong);
   box-shadow: var(--shadow);
 }
 
-.scores { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; }
-.score { flex: 1 1 10rem; min-width: 8rem; }
-.score:last-child { text-align: right; }
+.scores { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
 
-.score-label { margin: 0; font-size: 0.8125rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
-.score-east .score-label { color: var(--east); }
-.score-west .score-label { color: var(--west); }
+.score {
+  flex: 1 1 11rem;
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2);
+  border: var(--bw) solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+.score:last-child { text-align: right; }
+.score[data-team="EAST"] { border-color: var(--east); }
+.score[data-team="WEST"] { border-color: var(--west); }
+
+.score-label {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.score-east .score-label, .score[data-team="EAST"] .score-label { color: var(--east); }
+.score-west .score-label, .score[data-team="WEST"] .score-label { color: var(--west); }
 
 .score-value {
-  margin: 0.1rem 0 0;
+  margin: var(--sp-05) 0 0;
   font-family: var(--font-num);
   /* Tabular figures: totals must not jitter horizontally as they tick up. */
   font-variant-numeric: tabular-nums;
-  font-size: clamp(2rem, 8vw, 3.25rem);
+  font-size: clamp(1.75rem, 7vw, 3rem);
   font-weight: 700;
-  letter-spacing: -0.03em;
+  /* Zero tracking, not negative: pixel type never overlaps its own cell. */
+  letter-spacing: 0;
+  line-height: 1.05;
 }
-.score-unit { font-size: 0.9rem; font-weight: 600; color: var(--text-muted); margin-left: 0.3rem; }
-.score-share { margin: 0; font-size: 1rem; font-weight: 600; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.score-sub { margin: 0.15rem 0 0; font-size: 0.8125rem; color: var(--text-muted); }
+.score-unit {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-left: var(--sp-1);
+}
+.score-share {
+  margin: var(--sp-05) 0 0;
+  font-size: 0.9375rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.score-sub {
+  margin: var(--sp-05) 0 0;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  overflow-wrap: break-word;
+}
 
+/*
+ * Split bar. Drawn as DISCRETE CHUNKS: each fill is a repeating-linear-gradient with hard
+ * colour stops, so the bar reads as lit cells in a track rather than a smooth ramp. The
+ * track itself carries a 1px pixel grid for the unlit cells.
+ */
 .split {
   display: flex;
-  height: 14px;
-  margin: 1rem 0 0.75rem;
-  border-radius: 999px;
+  height: 24px;
+  /* --sp-4 above (the score cards carry their own --shadow-sm, which needs clearing), --sp-3
+     below, which both clears this bar's shadow and keeps it grouped with the leader line it
+     is a picture of. */
+  margin: var(--sp-4) 0 var(--sp-3);
   overflow: hidden;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
+  background-color: var(--surface-2);
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--border) 0 1px,
+    transparent 1px 6px
+  );
+  border: var(--bw) solid var(--border-strong);
+  box-shadow: var(--shadow-sm);
 }
 /* Widths come from the --share custom property, set through CSSOM in render.js. A style=""
    attribute in markup would be blocked by `style-src 'self'`; programmatic CSSOM is not. */
-.split-fill { width: var(--share, 50%); transition: width 240ms ease; }
-.split-fill-east { background: var(--east); }
-.split-fill-west { background: var(--west); }
-
-@media (prefers-reduced-motion: reduce) {
-  .split-fill { transition: none; }
+.split-fill {
+  width: var(--share, 50%);
+  min-width: 0;
+  /* Stepped, not eased: the bar advances cell by cell. */
+  transition: width 240ms steps(10, end);
+}
+/* Each side chunks outward from its own end of the track, so the two fills stay mirrored
+   and the gap between them always lands on a cell boundary. */
+.split-fill-east {
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--east) 0 10px,
+    transparent 10px 13px
+  );
+}
+.split-fill-west {
+  background-image: repeating-linear-gradient(
+    to left,
+    var(--west) 0 10px,
+    transparent 10px 13px
+  );
 }
 
-.leader-line { margin: 0; font-size: 1.05rem; font-weight: 600; }
-.leader-line.is-tie { font-weight: 500; color: var(--text-muted); }
-.totals-line { margin: 0.2rem 0 0; font-size: 0.875rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.leader-line {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  overflow-wrap: break-word;
+}
+.leader-line.is-tie { font-weight: 400; color: var(--text-muted); }
+.totals-line {
+  margin: var(--sp-1) 0 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: break-word;
+}
 
 /* ---------------------------------------------------------------- empty state ---- */
 
 .empty-state {
-  margin: 1.25rem 0;
-  padding: 1.5rem;
+  margin: var(--sp-5) 0;
+  padding: var(--sp-5);
   text-align: center;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius);
+  border: var(--bw) dashed var(--border-strong);
   background: var(--surface);
+  box-shadow: var(--shadow-sm);
 }
-.empty-state h2 { font-size: 1.15rem; }
-.empty-state p { margin: 0.5rem auto 0; max-width: 34rem; color: var(--text-muted); }
+.empty-state h2 { font-size: 1rem; }
+/* The gap above comes from the shared heading rule near the top; only the centring and the
+   measure are this block's business. */
+.empty-state p { margin: 0 auto; max-width: 34rem; color: var(--text-muted); }
 
 /* --------------------------------------------------------------------- roster ---- */
 
-.roster { margin: 1.5rem 0; }
-.roster h2 { font-size: 1.15rem; margin-bottom: 0.5rem; }
+.roster { margin: var(--sp-5) 0; }
+.roster h2 { font-size: 1rem; }
+
+/*
+ * The notes under the table (#roster-empty, #roster-note, #sync-line). They need an explicit
+ * top margin: the base `p` rule only ships a BOTTOM margin, so before this the first note sat
+ * flush against .table-wrap — and .table-wrap paints --shadow (a 4px hard offset that takes
+ * part in no layout at all), so the text was overlapping the table's shadow. --sp-3 is the
+ * shadow-clearance step. Collapsing with the base rule's --sp-2 bottom margin keeps the notes
+ * --sp-3 apart from each other too, and #roster-empty is a setVisible target, so when it is
+ * `[hidden]` (the usual case) this margin goes away with it rather than doubling up.
+ */
+.roster > p { margin-top: var(--sp-3); }
+
+/*
+ * ...but the FIRST note after the table needs the shadow's 4px ADDED, not merely cleared.
+ *
+ * --shadow is a hard offset that takes part in no layout, so a --sp-3 gap below .table-wrap
+ * renders as only 8px of VISIBLE air while the note-to-note gap renders the full 12px. The
+ * table then reads as crowded against its own caption while the two captions sit
+ * comfortably apart — an inverted rhythm, since the notes belong together and the table is
+ * a separate block.
+ *
+ * Two selectors because #roster-empty sits between the table and #roster-note and is a
+ * setVisible target: `:not([hidden])` catches it when it IS shown (the empty-roster case),
+ * and `p[hidden] + p` moves the clearance onto #roster-note in the usual case where it is
+ * not. `el.hidden = true` reflects to the attribute, so the selector tracks the real state.
+ */
+.table-wrap + p:not([hidden]),
+.table-wrap + p[hidden] + p { margin-top: calc(var(--sp-3) + var(--bw-lg)); }
 
 .table-wrap {
+  /* The one intentional scroll container: chunky borders plus six columns will not fit a
+     narrow phone, and scrolling here beats clipping names or overflowing the page. */
   overflow-x: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: var(--bw-lg) solid var(--border-strong);
   background: var(--surface);
+  box-shadow: var(--shadow);
 }
 
-table.riders { width: 100%; border-collapse: collapse; font-size: 0.9375rem; }
+table.riders {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
 
 table.riders th, table.riders td {
-  padding: 0.55rem 0.7rem;
+  padding: var(--sp-2) var(--sp-3);
   text-align: left;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 2px solid var(--border);
   vertical-align: middle;
 }
 table.riders tbody tr:last-child td { border-bottom: 0; }
 
 table.riders th {
-  font-size: 0.75rem;
-  letter-spacing: 0.06em;
+  font-size: 0.6875rem;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
+  font-weight: 700;
   color: var(--text-muted);
   background: var(--surface-2);
   position: sticky;
   top: 0;
+  z-index: 1;
+  /* An inset shadow, not a border: `border-collapse: collapse` drops the borders of a
+     sticky header once it detaches, and the chunky rule under the header is the whole
+     point of the header. */
+  border-bottom: 0;
+  box-shadow: inset 0 calc(-1 * var(--bw)) 0 0 var(--border-strong);
+  white-space: nowrap;
 }
 
 .num { text-align: right; font-family: var(--font-num); font-variant-numeric: tabular-nums; }
-.col-rank { width: 3rem; text-align: right; color: var(--text-muted); }
+.col-rank { width: 3.25rem; text-align: right; color: var(--text-muted); }
+.col-team { white-space: nowrap; }
 .col-miles { font-weight: 700; }
 
-.rider-row.is-you { background: var(--east-soft); }
-.rider-row.is-you .col-rank { color: var(--text); }
-/* A left rail rather than a colour-only cue, so "your row" survives colour blindness. */
-.rider-row.is-you td:first-child { box-shadow: inset 3px 0 0 0 var(--east); }
+.rider-row.is-you, .rider-row[aria-current="true"] { background: var(--east-soft); }
+.rider-row.is-you .col-rank, .rider-row[aria-current="true"] .col-rank { color: var(--text); }
+/* A chunky left rail rather than a colour-only cue, so "your row" survives colour
+   blindness — and at 6px it reads as a pixel block, not a hairline. */
+.rider-row.is-you td:first-child,
+.rider-row[aria-current="true"] td:first-child { box-shadow: inset 6px 0 0 0 var(--east); }
 .rider-row.is-unranked { color: var(--text-muted); }
-.rider-row.is-frozen .col-miles { opacity: 0.75; }
+.rider-row.is-frozen .col-miles { color: var(--text-muted); }
 
-.col-rider { display: flex; align-items: center; gap: 0.6rem; }
-.rider-ident { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
-.rider-name { display: flex; align-items: center; gap: 0.4rem; }
-.rider-name a { color: inherit; text-decoration: none; font-weight: 600; }
+/* Scoped to the body cell: a `display: flex` <th> stops being a table-cell and no longer
+   sizes its column, so the header would drift out of line with the rows below it. */
+td.col-rider { display: flex; align-items: center; gap: var(--sp-2); }
+.rider-ident { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+.rider-name { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; min-width: 0; }
+.rider-name a {
+  color: inherit;
+  text-decoration: none;
+  font-weight: 700;
+  /* Strava display names are arbitrary and can be one long unbroken string. */
+  overflow-wrap: anywhere;
+}
 .rider-name a:hover { text-decoration: underline; }
-.rider-name a.no-link { color: var(--text-muted); cursor: default; }
+.rider-name a.no-link { color: var(--text-muted); cursor: default; text-decoration: none; }
 
-.avatar { border-radius: 50%; background: var(--surface-2); object-fit: cover; flex: 0 0 auto; }
+.avatar {
+  /* Sprite, not portrait: square, hard-edged, nearest-neighbour upscaled. Scoped to
+     .avatar so it can never reach the Strava brand images. */
+  image-rendering: pixelated;
+  border: 2px solid var(--border-strong);
+  background: var(--surface-2);
+  object-fit: cover;
+  flex: 0 0 auto;
+}
 .avatar-sm { width: 28px; height: 28px; }
 
 .you-tag {
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
   color: var(--east);
-  border: 1px solid var(--east);
-  border-radius: 999px;
-  padding: 0 0.35rem;
+  border: 2px solid var(--east);
+  padding: 0 0.3rem;
+  white-space: nowrap;
 }
 
 .chip {
   display: inline-block;
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   font-weight: 700;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 0.4rem;
+  border: 2px solid var(--border);
   background: var(--surface-2);
   color: var(--text-muted);
   white-space: nowrap;
 }
-.chip[data-team="EAST"] { background: var(--east-soft); color: var(--east); }
-.chip[data-team="WEST"] { background: var(--west-soft); color: var(--west); }
-.chip-sm { font-size: 0.6875rem; }
+.chip[data-team="EAST"] { background: var(--east-soft); color: var(--east); border-color: var(--east); }
+.chip[data-team="WEST"] { background: var(--west-soft); color: var(--west); border-color: var(--west); }
+.chip-sm { font-size: 0.625rem; }
 
-.badges { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.badges { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
 .badge {
-  font-size: 0.6875rem;
-  font-weight: 600;
-  padding: 0.05rem 0.4rem;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong);
+  font-size: 0.625rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 0.3rem;
+  border: 2px solid var(--border);
   color: var(--text-muted);
   background: var(--surface-2);
   cursor: help;
+  white-space: nowrap;
 }
+.badge-public-only { border-color: var(--border-strong); }
 .badge-revoked { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
 
-/* --------------------------------------------------------------- team dialog ---- */
+/* ----------------------------------------------------------------- team dialog ---- */
 
 .team-dialog {
   max-width: 30rem;
-  width: calc(100% - 2rem);
-  padding: 1.4rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
+  /* --sp-8 = --sp-4 of gutter on each side, which also clears the dialog's 6px --shadow-lg. */
+  width: calc(100% - var(--sp-8));
+  padding: var(--sp-5);
+  border: var(--bw-lg) solid var(--border-strong);
   background: var(--surface);
   color: var(--text);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-lg);
 }
-.team-dialog::backdrop { background: rgb(10 12 15 / 55%); }
-.team-dialog h2 { font-size: 1.2rem; }
-.team-dialog p { color: var(--text-muted); }
+/* Dithered backdrop instead of a flat wash — a hard-stop diagonal over a tinted overlay.
+   No pure black: the tint is a deep indigo so the page behind stays legible as texture. */
+.team-dialog::backdrop {
+  background-color: rgb(10 12 26 / 78%);
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgb(10 12 26 / 55%) 0 2px,
+    transparent 2px 6px
+  );
+}
+.team-dialog h2 { font-size: 1.0625rem; }
+.team-dialog p { color: var(--text-muted); font-size: 0.8125rem; }
 
-.team-choices { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1rem 0; }
+.team-choices { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: var(--sp-4) 0; }
 .btn-team {
   flex: 1 1 9rem;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
+  gap: var(--sp-05);
   align-items: flex-start;
-  padding: 0.8rem 1rem;
+  text-align: left;
+  padding: 0.7rem 0.8rem;
+  letter-spacing: 0.06em;
 }
-.btn-team-name { font-size: 1.15rem; font-weight: 700; }
-.btn-team-sub { font-size: 0.8125rem; font-weight: 500; color: var(--text-muted); }
-.btn-team-east { border-color: var(--east); background: var(--east-soft); }
-.btn-team-east .btn-team-name { color: var(--east); }
-.btn-team-west { border-color: var(--west); background: var(--west-soft); }
-.btn-team-west .btn-team-name { color: var(--west); }
+.btn-team-name { font-size: 1rem; font-weight: 700; }
+.btn-team-sub {
+  font-size: 0.625rem;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  overflow-wrap: break-word;
+}
+.btn-team-east, .btn-team[data-team="EAST"] { border-color: var(--east); background: var(--east-soft); }
+.btn-team-east .btn-team-name, .btn-team[data-team="EAST"] .btn-team-name { color: var(--east); }
+.btn-team-west, .btn-team[data-team="WEST"] { border-color: var(--west); background: var(--west-soft); }
+.btn-team-west .btn-team-name, .btn-team[data-team="WEST"] .btn-team-name { color: var(--west); }
 
-.dialog-error { margin: 0 0 0.5rem; color: var(--danger); font-size: 0.875rem; min-height: 1.2em; }
+.dialog-error {
+  margin: 0 0 var(--sp-2);
+  color: var(--danger);
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-height: 1.2em;
+  overflow-wrap: break-word;
+}
 .dialog-error:empty { min-height: 0; }
 
 /* --------------------------------------------------------------------- footer ---- */
@@ -406,21 +916,37 @@ table.riders th {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 1rem;
-  margin-top: 2rem;
-  padding-top: 1rem;
-  border-top: 1px solid var(--border);
+  gap: var(--sp-4);
+  margin-top: var(--sp-8);
+  padding-top: var(--sp-4);
+  border-top: var(--bw) dashed var(--border-strong);
 }
 /* Attribution is a contractual requirement: visible without interaction. Never add
-   display:none, visibility:hidden, opacity:0, or a hover-only reveal to .powered-by. */
+   display:none, visibility:hidden, opacity:0, or a hover-only reveal to .powered-by — and
+   as with .strava-connect, nothing here may repaint the <img> itself. */
 .powered-by { display: inline-flex; line-height: 0; flex: 0 0 auto; }
 .powered-by img { width: 140px; height: 28px; }
+.powered-by:hover, .powered-by:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
 .footer-note { flex: 1 1 20rem; margin: 0; }
 
-/* ------------------------------------------------------------------- narrow ---- */
+/* ----------------------------------------------------------- reduced motion ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .split-fill { transition: none; }
+  .btn.is-pending, .btn[aria-busy="true"] { animation: none; }
+}
+
+/* --------------------------------------------------------------------- narrow ---- */
 
 @media (max-width: 34rem) {
   .score:last-child { text-align: left; }
   .masthead-actions { width: 100%; }
+  /* "Longest" is the one droppable column on a phone. */
   table.riders th:nth-child(6), table.riders td:nth-child(6) { display: none; }
+  /* Thinner chunk, same look: 4px borders plus 6px shadows eat a 320px viewport. */
+  :root { --bw: 2px; --bw-lg: 3px; }
+  .split { height: 20px; }
 }

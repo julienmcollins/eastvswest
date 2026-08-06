@@ -33,6 +33,20 @@ const RIDER_ID = 12345678;
 /** Hand-computed in the fixture generator: 210 counted records, 360493.056 m. */
 const FIXTURE = JSON.parse(readFileSync(new URL('./fixtures/activities.json', import.meta.url), 'utf8'));
 
+/**
+ * Per-month expectations, because every calendar month is now its own competition.
+ *
+ * `FIXTURE.expected.counted_miles` (224.0) is the sum across the fixture's three months and is
+ * therefore no longer what ANY single request returns. The routes below default to the current
+ * month in COMPETITION_TZ, which the harness pins to August, so `AUG` is what an un-parameterised
+ * call must produce. Keeping both means a test can still say which it means instead of quietly
+ * asserting a number that happens to match.
+ *
+ * AUG = 202 records / 202.0 mi, JUL = 6 / 20.0, JUN = 2 / 2.0.
+ */
+const AUG = FIXTURE.expected.by_month['2026-08'];
+const JUL = FIXTURE.expected.by_month['2026-07'];
+
 const LOG_RECORDS = [];
 const RESPONSE_BODIES = [];
 
@@ -104,8 +118,11 @@ test('GET /api/me is 200 with rider:null when logged out -- never 401', async ()
   assert.equal(res.json.authenticated, false);
   assert.equal(res.json.rider, null);
   assert.equal(res.json.schema, API_SCHEMA);
-  // The competition block is a season-level fact and is present for anonymous callers too.
-  assert.equal(res.json.competition.start, '2026-06-01');
+  // The competition block describes ONE MONTH and is present for anonymous callers too.
+  // Absent a `?month=`, that month is the current one in COMPETITION_TZ, which the harness
+  // pins to August -- so these bounds are August's, not the configured season's.
+  assert.equal(res.json.competition.month, '2026-08');
+  assert.equal(res.json.competition.start, '2026-08-01');
   assert.equal(res.json.competition.end, '2026-08-31');
   assert.equal(res.json.competition.state, 'open');
   assert.equal(res.json.competition.timezone, 'UTC');
@@ -275,11 +292,11 @@ test('POST /api/me/sync stores the fixture and embeds the whole leaderboard', as
   // The embedded leaderboard is what makes Refresh one round trip.
   const lb = res.json.leaderboard;
   assert.equal(lb.schema, API_SCHEMA);
-  assert.equal(res.json.miles, FIXTURE.expected.counted_miles);
+  assert.equal(res.json.miles, AUG.miles);
 
   const east = lb.teams.find((t) => t.team === 'EAST');
-  assert.equal(east.miles, FIXTURE.expected.counted_miles, 'EAST must total the fixture constant');
-  assert.equal(east.ride_count, FIXTURE.expected.counted_records);
+  assert.equal(east.miles, AUG.miles, 'EAST must total the selected month, not the whole fixture');
+  assert.equal(east.ride_count, AUG.records);
 
   // Every excluded fixture id must be absent from the totals but PRESENT in the table -- we
   // store everything and filter at query time.
@@ -429,7 +446,7 @@ test('GET /api/leaderboard keeps a zero-mile team and zero-mile riders on the bo
   assert.equal(lb.teams.length, 2);
   assert.equal(lb.teams[0].team, 'EAST');
   assert.equal(lb.teams[1].team, 'WEST');
-  assert.equal(lb.teams[0].miles, FIXTURE.expected.counted_miles);
+  assert.equal(lb.teams[0].miles, AUG.miles);
   // WEST has a member and no rides. A WHERE on the joined table would have deleted this row.
   assert.equal(lb.teams[1].miles, 0);
   assert.equal(lb.teams[1].rider_count, 1);
@@ -442,7 +459,7 @@ test('GET /api/leaderboard keeps a zero-mile team and zero-mile riders on the bo
   const me = lb.riders.find((r) => r.athlete_id === RIDER_ID);
   assert.equal(me.rank, 1);
   assert.equal(me.is_you, true);
-  assert.equal(me.miles, FIXTURE.expected.counted_miles);
+  assert.equal(me.miles, AUG.miles);
 
   const zero = lb.riders.find((r) => r.athlete_id === 44444444);
   assert.equal(zero.miles, 0);
@@ -459,19 +476,166 @@ test('GET /api/leaderboard keeps a zero-mile team and zero-mile riders on the bo
   assert.equal(anon.json.riders.every((r) => r.is_you === false), true);
 });
 
-test('?start/?end narrow the window but cannot widen it past the competition', async () => {
+test('?month= selects a month, is validated strictly, and is clamped to the picker bounds', async () => {
   const { app, fake } = await harness();
   const auth = await signIn(app, fake);
   await post(app, '/api/me/team', { team: 'EAST' }, auth);
   await post(app, '/api/me/sync', {}, auth);
 
-  // A hand-edited all-time range must not turn the board into a lifetime ranking won by
-  // whoever has the longest Strava history.
-  const wide = await call(app, { method: 'GET', url: '/api/leaderboard?start=2000-01-01&end=2099-12-31' });
-  assert.equal(wide.json.teams[0].miles, FIXTURE.expected.counted_miles);
+  // This test replaces an older `?start`/`?end` pair. Those params are gone: an arbitrary
+  // caller-supplied range was exactly how a hand-edited URL could turn the board into a
+  // lifetime ranking won by whoever has the longest Strava history. A single `?month=` cannot
+  // express that at all, which is the point -- but it still has to be validated and clamped,
+  // and each of the three properties below is one way that could go wrong.
 
-  const narrow = await call(app, { method: 'GET', url: '/api/leaderboard?start=2026-07-01&end=2026-07-01' });
-  assert.ok(narrow.json.teams[0].miles < FIXTURE.expected.counted_miles);
+  // 1. A named month returns THAT month, not the default one.
+  const july = await call(app, { method: 'GET', url: '/api/leaderboard?month=2026-07' });
+  assert.equal(july.status, 200);
+  assert.equal(july.json.competition.month, '2026-07');
+  assert.equal(july.json.teams[0].miles, JUL.miles, 'July is its own competition');
+
+  // The default month must differ from it, or this test proves nothing.
+  const dflt = await call(app, { method: 'GET', url: '/api/leaderboard' });
+  assert.equal(dflt.json.competition.month, '2026-08');
+  assert.equal(dflt.json.teams[0].miles, AUG.miles);
+  assert.notEqual(JUL.miles, AUG.miles);
+
+  // 2. Out of range is CLAMPED, not honoured, and the response says which month it settled
+  //    on so the picker can correct itself rather than lying about what is on screen.
+  const far = await call(app, { method: 'GET', url: '/api/leaderboard?month=2099-12' });
+  assert.equal(far.status, 200);
+  assert.equal(far.json.competition.month, far.json.competition.last_month);
+  const ancient = await call(app, { method: 'GET', url: '/api/leaderboard?month=1999-01' });
+  assert.equal(ancient.status, 200);
+  assert.equal(ancient.json.competition.month, ancient.json.competition.first_month);
+
+  // 3. Malformed is a 400, never a silent substitution of the current month -- that would
+  //    render a board disagreeing with the URL that produced it.
+  for (const bad of ['august', '2026-13', '2026-00', '2026', '2026-7', '2026-08-01', "2026-08' OR 1=1"]) {
+    const res = await call(app, { method: 'GET', url: `/api/leaderboard?month=${encodeURIComponent(bad)}` });
+    assert.equal(res.status, 400, `month=${JSON.stringify(bad)} must be rejected`);
+    assert.equal(res.json.error, 'bad_request');
+  }
+
+  // An EMPTY `?month=` is deliberately "absent", not malformed: `<select>`-driven URLs and
+  // hand-trimmed links both produce it, and 400-ing a blank value would break the bare link
+  // for no gain. Asserted explicitly so the distinction is a decision, not an accident.
+  const blank = await call(app, { method: 'GET', url: '/api/leaderboard?month=' });
+  assert.equal(blank.status, 200);
+  assert.equal(blank.json.competition.month, '2026-08');
+});
+
+test('the picker range covers every month that HAS rides, not just the configured season', async () => {
+  const { app, fake } = await harness();
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+  await post(app, '/api/me/sync', {}, auth);
+
+  // The configured season is 2026-06-01..2026-08-31, but the sync window is padded a day on each
+  // end, so the fixture's 2026-05-31 and 2026-09-01 rides are genuinely stored -- and before the
+  // range became a union they were unreachable: `?month=2026-05` answered with June's board and
+  // the payload gave no hint that a substitution had happened.
+  const lb = await call(app, { method: 'GET', url: '/api/leaderboard' });
+  assert.equal(lb.json.competition.first_month, '2026-05', 'a data month before the season is offered');
+  assert.equal(lb.json.competition.last_month, '2026-09', 'and one after it');
+  assert.equal(lb.json.competition.month, '2026-08', 'the default still opens on the configured season');
+
+  const may = await call(app, { method: 'GET', url: '/api/leaderboard?month=2026-05' });
+  assert.equal(may.json.competition.month, '2026-05', 'not clamped to June any more');
+  // The fixture's out-of-season ride is a deliberate 99-mile monster: under the old rule this
+  // request silently returned June's 2.0 mi instead, which is the failure that hid worst -- a
+  // plausible number for a month whose real total was something else entirely.
+  assert.equal(may.json.teams[0].miles, 99, 'the one May ride, and only it');
+  assert.equal(may.json.competition.prev_month, null, 'and it is the start of the range');
+
+  // Every endpoint that takes `?month=` must agree about the range, or the masthead, the board and
+  // an expanded rider drawer describe three different months on one screen.
+  const me = await call(app, { method: 'GET', url: '/api/me?month=2026-05', cookies: { bc_sid: auth.sid } });
+  assert.equal(me.json.competition.first_month, '2026-05');
+  assert.equal(me.json.competition.last_month, '2026-09');
+  assert.equal(me.json.competition.month, '2026-05');
+
+  const rides = await call(app, {
+    method: 'GET',
+    url: `/api/riders/${RIDER_ID}/activities?month=2026-05`,
+    cookies: { bc_sid: auth.sid },
+  });
+  assert.equal(rides.status, 200);
+  assert.equal(rides.json.month, '2026-05');
+  assert.deepEqual(rides.json.window, { start: '2026-05-01', end: '2026-05-31' });
+  assert.equal(rides.json.activities.length, 1);
+  assert.equal(rides.json.activities[0].local_date, '2026-05-31');
+
+  // CONTIGUITY: walk next_month from one end to the other and require every step to resolve to
+  // itself. A hole would surface as a clamp, and prev/next would dead-end on it with no way for
+  // the client to know -- it does no month arithmetic of its own.
+  const walked = [];
+  let cursor = lb.json.competition.first_month;
+  while (cursor !== null) {
+    const step = await call(app, { method: 'GET', url: `/api/leaderboard?month=${cursor}` });
+    assert.equal(step.status, 200);
+    assert.equal(step.json.competition.month, cursor, `${cursor} must resolve to itself`);
+    walked.push(cursor);
+    cursor = step.json.competition.next_month;
+  }
+  assert.deepEqual(walked, ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09']);
+
+  // Strict validation is unchanged on the two other month-taking endpoints, so widening the range
+  // did not widen what counts as a valid month.
+  for (const bad of ['august', '2026-13', '2026-00', '2026', '2026-7', '2026-08-01']) {
+    const q = `month=${encodeURIComponent(bad)}`;
+    const onMe = await call(app, { method: 'GET', url: `/api/me?${q}`, cookies: { bc_sid: auth.sid } });
+    assert.equal(onMe.status, 400, `/api/me?${q}`);
+    const onRides = await call(app, {
+      method: 'GET',
+      url: `/api/riders/${RIDER_ID}/activities?${q}`,
+      cookies: { bc_sid: auth.sid },
+    });
+    assert.equal(onRides.status, 400, `/api/riders/:id/activities?${q}`);
+  }
+  // ...and an empty value still means "absent" on both.
+  const blankMe = await call(app, { method: 'GET', url: '/api/me?month=', cookies: { bc_sid: auth.sid } });
+  assert.equal(blankMe.status, 200);
+  assert.equal(blankMe.json.competition.month, '2026-08');
+  const blankRides = await call(app, {
+    method: 'GET',
+    url: `/api/riders/${RIDER_ID}/activities?month=`,
+    cookies: { bc_sid: auth.sid },
+  });
+  assert.equal(blankRides.status, 200);
+  assert.equal(blankRides.json.month, '2026-08');
+});
+
+test("a one-month COMPETITION_START/END serves a picker the client will render", async () => {
+  // The reported configuration, verbatim: START and END inside one calendar month. The range used
+  // to be exactly [2026-09, 2026-09], the client hid a picker with nothing to switch between, and
+  // the feature looked unbuilt. The current month now joins the range unconditionally.
+  const { app, fake } = await harness({
+    configOverrides: { COMPETITION_START: '2026-09-01', COMPETITION_END: '2026-09-30' },
+  });
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+
+  const before = await call(app, { method: 'GET', url: '/api/leaderboard' });
+  assert.equal(before.status, 200);
+  assert.equal(before.json.competition.first_month, '2026-08', 'the current month (NOW is 2026-08-31)');
+  assert.equal(before.json.competition.last_month, '2026-09');
+  assert.equal(before.json.competition.month, '2026-09', 'opens on the configured competition');
+  assert.equal(before.json.competition.state, 'upcoming');
+  assert.equal(before.json.competition.prev_month, '2026-08', 'so the picker has a live affordance');
+
+  // After a sync the range grows to whatever got stored, with no `.env` edit -- which was the
+  // whole complaint. The fetch window spans the configured months UNION the current month, so
+  // the whole of August arrives, not just the last day of it: a window of "now to tomorrow" was
+  // the second half of this bug, where the sync answered `ok` and stored nothing at all.
+  await post(app, '/api/me/sync', {}, auth);
+  const after = await call(app, { method: 'GET', url: '/api/leaderboard' });
+  assert.equal(after.json.competition.first_month, '2026-08');
+  assert.equal(after.json.competition.last_month, '2026-09');
+  const august = await call(app, { method: 'GET', url: '/api/leaderboard?month=2026-08' });
+  assert.equal(august.json.competition.month, '2026-08');
+  assert.equal(august.json.teams[0].miles, AUG.miles, 'the whole current month, on a board the old range hid');
+  assert.ok(AUG.miles > 1, 'a fetch window covering only the final day would give 1');
 });
 
 test('GET /api/riders/:id/activities requires a session and carries no location data', async () => {
@@ -501,8 +665,10 @@ test('GET /api/riders/:id/activities requires a session and carries no location 
   assert.equal(res.body.includes('polyline'), false);
 
   // `counted` comes from the same SQL predicate as the totals, so the list agrees with them.
+  // Per MONTH now: this endpoint itemises one rider's rides for one month, so the count is
+  // August's 202 and not the 210 spanning the fixture's three months.
   const counted = res.json.activities.filter((a) => a.counted).length;
-  assert.equal(counted, FIXTURE.expected.counted_records);
+  assert.equal(counted, AUG.records);
 
   const missing = await call(app, { method: 'GET', url: '/api/riders/98765/activities', cookies: { bc_sid: auth.sid } });
   assert.equal(missing.status, 404);
@@ -629,12 +795,16 @@ test('an admin can list athletes, move a rider, flip admin, and approve a manual
   assert.equal(typeof row.last_synced_at, 'string');
 
   // Approving it makes it count, which is the whole point of the queue.
-  const before = (await call(app, { method: 'GET', url: '/api/leaderboard' })).json.teams[0].miles;
+  // Both reads are pinned to 2026-07, the month the manual fixture ride actually falls in
+  // (2026-07-09, 300 mi). Against the DEFAULT month the before/after totals are both August's
+  // and identical, so this assertion would fail while the feature worked perfectly.
+  const julyMiles = async () => (await call(app, { method: 'GET', url: '/api/leaderboard?month=2026-07' })).json.teams[0].miles;
+  const before = await julyMiles();
   const approve = await post(app, '/api/admin/activities/15000000014/approve', { approved: true }, auth);
   assert.equal(approve.status, 200);
   assert.equal(approve.json.is_manual, true);
-  const after = (await call(app, { method: 'GET', url: '/api/leaderboard' })).json.teams[0].miles;
-  assert.ok(after > before, 'an approved manual ride must start counting');
+  const after = await julyMiles();
+  assert.ok(after > before, `an approved manual ride must start counting (before=${before} after=${after})`);
 
   // An admin team change drops that athlete's sessions so the privilege/state change cannot
   // linger in a live session.

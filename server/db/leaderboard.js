@@ -1,8 +1,8 @@
 import { TEAMS, TEAM_LABELS, API_SCHEMA, SCOPE_READ_ALL } from '../contracts.js';
 import { milesFromMeters, metersToMiles, round1, share } from '../lib/units.js';
-import { competitionStatus, resolveWindow, isoUtcNow, isoFromEpoch } from '../lib/dates.js';
-import { countedPredicate } from './activities.js';
-import { placeholders } from './db.js';
+import { monthStatus, resolveMonth, isoUtcNow, isoFromEpoch } from '../lib/dates.js';
+import { countedPredicate, selectableMonthBounds } from './activities.js';
+import { placeholders } from './bind.js';
 import { normalizeAvatarUrl } from './athletes.js';
 
 /**
@@ -85,18 +85,25 @@ export async function riderTotals(db, config, window) {
 }
 
 /**
- * Build the entire `GET /api/leaderboard` payload.
+ * Build the entire `GET /api/leaderboard` payload for ONE MONTH.
  *
  * The same object is embedded verbatim in the `POST /api/me/sync` response, so Refresh is one
  * round trip. Its shape is frozen by test/fixtures/leaderboard.sample.json.
  *
- * @param {{window?:{start:string,end:string}, viewerAthleteId?:number|null, nowMs?:number}} opts
+ * @param {{month?:string|null, viewerAthleteId?:number|null, nowMs?:number}} opts
+ *   `month` is `YYYY-MM`; anything unusable resolves to the current month (clamped to the
+ *   picker bounds). The route has already validated and rejected malformed input.
  */
-export async function buildLeaderboard(db, config, { window, viewerAthleteId = null, nowMs = Date.now() } = {}) {
-  // Re-clamp even though the route already resolved the window. Clamping is cheap, and it
-  // guarantees no hand-edited `?start=2000-01-01` can reach SQL and turn the competition into
-  // an all-time ranking won by whoever has the longest Strava history.
-  const win = resolveWindow(config, window ?? {});
+export async function buildLeaderboard(db, config, { month = null, viewerAthleteId = null, nowMs = Date.now() } = {}) {
+  // The selectable range is read BEFORE the month is resolved, because it is what the resolution
+  // clamps against: with the old config-only range, a request for a month that holds rides but
+  // sits outside COMPETITION_START..END answered with a different month's numbers.
+  const bounds = await selectableMonthBounds(db, config, nowMs);
+  // Resolved here as well as in the route. Resolution is cheap, and doing it at the SQL
+  // boundary is what guarantees the aggregate below is always bound to a real single-month
+  // window -- never to a hand-edited multi-month range, and never to `undefined`, which
+  // SQLite refuses to bind at all.
+  const win = resolveMonth(config, month, nowMs, bounds);
 
   const [teamRows, riderRows] = await Promise.all([
     teamTotals(db, config, win),
@@ -194,10 +201,10 @@ export async function buildLeaderboard(db, config, { window, viewerAthleteId = n
 
   return {
     schema: API_SCHEMA,
-    // The competition block describes the CONFIGURED season, not the requested window: `state`
-    // and `days_remaining` are season-level facts, and a narrowed ?start/?end must not make the
-    // competition look shorter than it is.
-    competition: competitionStatus(config, nowMs),
+    // Describes the SELECTED MONTH -- which is the whole competition now. `state` and
+    // `days_remaining` are facts about this month, so an ended month reports `closed` with 0
+    // days left while the reader is looking at it, and switching months switches the verdict.
+    competition: monthStatus(config, win.month, nowMs, bounds),
     units: { distance: 'mi' },
     teams,
     totals,

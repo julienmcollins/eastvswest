@@ -1,5 +1,5 @@
 import { SYNC_WINDOW_PAD_SECONDS } from '../contracts.js';
-import { epochAtStartOfDate, epochAtEndOfDate } from '../lib/dates.js';
+import { epochAtStartOfDate, epochAtEndOfDate, startOfMonth, endOfMonth, monthOf, todayInTz } from '../lib/dates.js';
 
 /**
  * Pure translation layer between Strava's JSON and this app's own shapes.
@@ -229,6 +229,21 @@ export function maxStartEpoch(activities, seed = 0) {
 /**
  * The [after, before] window to ask Strava for, in unix seconds.
  *
+ * ONE fetch range covers EVERY month worth fetching. It is deliberately not per-month: sync
+ * stores everything and the leaderboard filters at query time (sync.js rule 1), so a
+ * per-month fetch would multiply requests against a rate-limited API to produce data we
+ * already have. The range spans the CONFIGURED months -- from the first day of
+ * `competitionFirstMonth` to the last day of `competitionLastMonth` -- which is a superset
+ * of `[COMPETITION_START, COMPETITION_END]` whenever those dates fall mid-month, and that
+ * widening is required: a START of 2026-06-15 makes all of June selectable, so June 1-14
+ * must be fetchable or that month's board is silently short.
+ *
+ * Note this is NARROWER than the month picker, which additionally offers the current month and
+ * every month that already holds data (see `monthBounds` in server/lib/dates.js). That is the
+ * intended split: what we FETCH is a config decision, because it is what spends rate limit,
+ * while what a reader may BROWSE is everything we already hold. A selectable month outside this
+ * range renders as an empty board rather than triggering a fetch nobody asked for.
+ *
  * Padded by SYNC_WINDOW_PAD_SECONDS (86400) on BOTH ends. The justification is that it
  * is correct under BOTH possible readings of `before`/`after` -- whether Strava compares
  * `start_date` (UTC) or `start_date_local` -- because no UTC offset exceeds 14 hours,
@@ -236,10 +251,10 @@ export function maxStartEpoch(activities, seed = 0) {
  * Strava filters on UTC; if that claim turns out to be false, this window is still right.
  *
  * `mode:'incremental'` starts from the watermark; `mode:'full'` ignores it and rescans
- * the whole competition, because a watermark alone is provably wrong here: a trip
- * uploaded a week late, a Garmin backfill, or a ride flipped from "Only You" to
- * "Everyone" all have a start_date older than the watermark, and /athlete/activities has
- * no `modified_after` to find them with.
+ * the whole range, because a watermark alone is provably wrong here: a trip uploaded a
+ * week late, a Garmin backfill, or a ride flipped from "Only You" to "Everyone" all have
+ * a start_date older than the watermark, and /athlete/activities has no `modified_after`
+ * to find them with.
  */
 export function computeSyncWindow(config, { mode = 'full', watermarkEpoch = 0, nowMs = Date.now() } = {}) {
   if (mode !== 'full' && mode !== 'incremental') {
@@ -247,22 +262,52 @@ export function computeSyncWindow(config, { mode = 'full', watermarkEpoch = 0, n
   }
   if (!Number.isFinite(nowMs)) throw new StravaMapError(`computeSyncWindow: nowMs must be finite, got ${nowMs}.`);
 
-  const competitionStart = epochAtStartOfDate(config.competitionStart);
-  const competitionEnd = epochAtEndOfDate(config.competitionEnd);
+  // The fetch range spans the configured months UNION THE CURRENT MONTH.
+  //
+  // The current month is in here because leaving it out is a silent, total failure. With
+  // COMPETITION_START/END set to a month that has not begun (September, say, configured in
+  // August) the configured range is entirely in the future, `after` gets clamped to now by
+  // the rule below, and every sync then asks Strava for "rides between now and tomorrow" --
+  // succeeding, reporting `ok`, and storing NOTHING, for weeks. The rider sees 0.0 mi with
+  // "last sync just now" beside it and no error anywhere to point at.
+  //
+  // It is also what makes the month picker honest: the picker offers the current month
+  // unconditionally, so refusing to FETCH it guarantees at least one selectable month that
+  // can only ever be empty.
+  //
+  // Deliberately still bounded, not "all of history": this is the one decision in the app
+  // that spends Strava rate limit, so it grows by exactly one month rather than by whatever
+  // the picker happens to be offering (which is itself derived from what was fetched, and
+  // would be circular).
+  const currentMonth = monthOf(todayInTz(config.competitionTz, nowMs));
+  const rangeStart = Math.min(
+    epochAtStartOfDate(startOfMonth(config.competitionFirstMonth)),
+    epochAtStartOfDate(startOfMonth(currentMonth)),
+  );
+  const rangeEnd = Math.max(
+    epochAtEndOfDate(endOfMonth(config.competitionLastMonth)),
+    epochAtEndOfDate(endOfMonth(currentMonth)),
+  );
   const nowSeconds = Math.floor(nowMs / 1000);
 
-  // Never ask for the future, and never past the competition: rides after END cannot
-  // score, and fetching them only spends rate limit.
-  const upper = Math.min(nowSeconds, competitionEnd);
+  // Never ask for the future, and never past the end of the range: rides after it are
+  // outside anything anyone can select, and asking for them only spends rate limit.
+  const upper = Math.min(nowSeconds, rangeEnd);
 
-  let lower = competitionStart;
-  if (mode === 'incremental' && Number.isFinite(watermarkEpoch) && watermarkEpoch > competitionStart) {
+  let lower = rangeStart;
+  if (mode === 'incremental' && Number.isFinite(watermarkEpoch) && watermarkEpoch > rangeStart) {
     lower = watermarkEpoch;
   }
 
-  const afterEpoch = Math.max(0, lower - SYNC_WINDOW_PAD_SECONDS);
-  // Math.max keeps the window non-empty before the competition opens, where
-  // min(now, END) is below START and a naive subtraction would invert the range.
+  // Clamped to `now` as well as to 0, because `after` is the one bound Strava validates:
+  // a future value is rejected outright with 400 {field:'after', code:'future'}. Before the
+  // first selectable month, RANGE_START - 86400 is still in the future, so an unclamped
+  // `after` makes EVERY sync fail with a 502 instead of succeeding with nothing to show.
+  // `upper` was already clamped to now on the line above; this is the same rule applied to
+  // the lower bound. A future `before` is fine and is the normal case every day of a month.
+  const afterEpoch = Math.max(0, Math.min(lower - SYNC_WINDOW_PAD_SECONDS, nowSeconds));
+  // Math.max keeps the window non-empty before the first month opens, where
+  // min(now, RANGE_END) is below RANGE_START and a naive subtraction would invert the range.
   const beforeEpoch = Math.max(upper + SYNC_WINDOW_PAD_SECONDS, afterEpoch + 1);
 
   return { afterEpoch, beforeEpoch };

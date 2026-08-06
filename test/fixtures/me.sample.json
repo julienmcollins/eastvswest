@@ -16,17 +16,23 @@
       "last_synced_at": "2026-08-04T18:22:01.000Z"
     },
     "competition": {
-      "start": "2026-06-01",
+      "month": "2026-08",
+      "start": "2026-08-01",
       "end": "2026-08-31",
       "state": "open",
       "today": "2026-08-04",
       "days_remaining": 28,
       "timezone": "UTC",
+      "first_month": "2026-06",
+      "last_month": "2026-08",
+      "prev_month": "2026-07",
+      "next_month": null,
+      "current_month": "2026-08",
       "allowed_sport_types": ["Ride", "GravelRide", "MountainBikeRide", "VirtualRide"],
       "manual_rides_counted": false
     },
     "server_time": "2026-08-04T19:52:00.000Z",
-    "schema": 1
+    "schema": 2
   },
   "new_rider_needing_team": {
     "authenticated": true,
@@ -44,37 +50,50 @@
       "last_synced_at": null
     },
     "competition": {
-      "start": "2026-06-01",
+      "month": "2026-08",
+      "start": "2026-08-01",
       "end": "2026-08-31",
       "state": "open",
       "today": "2026-08-04",
       "days_remaining": 28,
       "timezone": "UTC",
+      "first_month": "2026-06",
+      "last_month": "2026-08",
+      "prev_month": "2026-07",
+      "next_month": null,
+      "current_month": "2026-08",
       "allowed_sport_types": ["Ride", "GravelRide", "MountainBikeRide", "VirtualRide"],
       "manual_rides_counted": false
     },
     "server_time": "2026-08-04T19:52:00.000Z",
-    "schema": 1
+    "schema": 2
   },
   "anonymous": {
     "authenticated": false,
     "rider": null,
     "competition": {
-      "start": "2026-06-01",
+      "month": "2026-08",
+      "start": "2026-08-01",
       "end": "2026-08-31",
       "state": "open",
       "today": "2026-08-04",
       "days_remaining": 28,
       "timezone": "UTC",
+      "first_month": "2026-06",
+      "last_month": "2026-08",
+      "prev_month": "2026-07",
+      "next_month": null,
+      "current_month": "2026-08",
       "allowed_sport_types": ["Ride", "GravelRide", "MountainBikeRide", "VirtualRide"],
       "manual_rides_counted": false
     },
     "server_time": "2026-08-04T19:52:00.000Z",
-    "schema": 1
+    "schema": 2
   },
   "_invariants": [
     "needs_team is the ONE authoritative trigger for the team picker. The client must not infer it from a URL fragment or from team===null anywhere else.",
     "scope is 'read_all' or 'read'. 'read' means the rider unchecked private activities on Strava's consent screen: they stay fully functional, their public rides count, and the UI badges that private rides are not counted. It is never a lockout.",
-    "revoked true means the rider revoked access at Strava. Their row, team, and history all survive so their total freezes rather than vanishing mid-race."
+    "revoked true means the rider revoked access at Strava. Their row, team, and history all survive so their total freezes rather than vanishing mid-race.",
+    "competition is the SAME block GET /api/leaderboard returns and describes ONE SELECTED MONTH. /api/me accepts the same ?month=YYYY-MM, and the client must send the identical value to both boot calls -- otherwise the masthead describes a different month than the board rendered beside it. Both endpoints also compute first_month/last_month the same way, from the database rather than from config alone, or the masthead would advertise a narrower picker than the board it sits above."
   ]
 }

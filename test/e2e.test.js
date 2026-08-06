@@ -67,10 +67,29 @@ const EXPECTED = (() => {
   });
   const meters = scoring.reduce((s, a) => s + a.distance, 0);
 
+  // Per-month, because every calendar month is its own competition and one request returns
+  // ONE month. `miles` below stays the whole-window sum so the months can be checked to add
+  // up to it -- dropping that would let a month-filtering bug hide as a smaller total.
+  const byMonth = {};
+  for (const a of scoring) {
+    const month = dateOf(a.start_date_local).slice(0, 7);
+    byMonth[month] = byMonth[month] ?? { counted: 0, meters: 0 };
+    byMonth[month].counted += 1;
+    byMonth[month].meters += a.distance;
+  }
+  const monthMiles = {};
+  const monthCounted = {};
+  for (const [month, v] of Object.entries(byMonth)) {
+    monthMiles[month] = Math.round((v.meters / MILE) * 10) / 10;
+    monthCounted[month] = v.counted;
+  }
+
   return {
     stored: stored.length,
     counted: scoring.length,
     miles: Math.round((meters / MILE) * 10) / 10,
+    monthMiles,
+    monthCounted,
   };
 })();
 
@@ -239,7 +258,22 @@ test('the whole rider journey, in order', async (t) => {
     assert.equal(sync.json.activities_scanned, EXPECTED.stored);
     assert.equal(sync.json.activities_counted, EXPECTED.counted);
     assert.equal(sync.json.truncated, false);
-    assert.equal(sync.json.miles, EXPECTED.miles);
+
+    // `miles` is the SELECTED MONTH's total, so it is checked against the month the response
+    // says it resolved to rather than a hardcoded one. The server picks that month (the
+    // current one in COMPETITION_TZ, clamped to the picker bounds); asserting a literal here
+    // would encode a clamp rule this test is not the right place to re-derive.
+    const selected = sync.json.leaderboard.competition.month;
+    assert.ok(EXPECTED.monthMiles[selected] !== undefined, `fixture has no rides for ${selected}`);
+    assert.equal(sync.json.miles, EXPECTED.monthMiles[selected]);
+
+    // The months must still add up to the whole-window total this test used to assert, or a
+    // month filter that silently dropped rides would look like a pass.
+    assert.equal(
+      Object.values(EXPECTED.monthMiles).reduce((a, b) => a + b, 0),
+      EXPECTED.miles,
+      'per-month totals must sum to the full-window total',
+    );
 
     // Everything fetched is stored; only the query filters. Changing ALLOWED_SPORT_TYPES
     // later must not require re-syncing every rider against a rate-limited API.
@@ -249,7 +283,7 @@ test('the whole rider journey, in order', async (t) => {
 
     const lb = sync.json.leaderboard;
     assert.equal(lb.teams[0].team, 'EAST');
-    assert.equal(lb.teams[0].miles, EXPECTED.miles);
+    assert.equal(lb.teams[0].miles, EXPECTED.monthMiles[selected]);
     assert.equal(lb.teams[1].team, 'WEST');
     assert.equal(lb.teams[1].miles, 0, 'a zero-mile team must survive the LEFT JOIN');
     assert.equal(lb.leader.team, 'EAST');
@@ -291,7 +325,9 @@ test('the whole rider journey, in order', async (t) => {
       await db.run('UPDATE sync_state SET last_sync_finished = 0 WHERE athlete_id = ?', [RIDER_ID]);
       const retry = await call(app, { method: 'POST', url: '/api/me/sync', body: { mode: 'full' }, ...authed(auth) });
       assert.equal(retry.status, 200);
-      assert.equal(retry.json.miles, EXPECTED.miles, 'the total must not move');
+      // Against the month the response itself reports, for the reason given in step 5.
+      const month = retry.json.leaderboard.competition.month;
+      assert.equal(retry.json.miles, EXPECTED.monthMiles[month], 'the total must not move');
     }
     assert.equal(Number((await db.get('SELECT COUNT(*) n FROM activities')).n), before);
   });
@@ -312,7 +348,11 @@ test('the whole rider journey, in order', async (t) => {
     assert.notEqual(athlete.strava_revoked_at, null);
 
     const lb = await call(app, { method: 'GET', url: '/api/leaderboard' });
-    assert.equal(lb.json.teams[0].miles, EXPECTED.miles, 'the frozen total still counts');
+    assert.equal(
+      lb.json.teams[0].miles,
+      EXPECTED.monthMiles[lb.json.competition.month],
+      'the frozen total still counts',
+    );
     assert.equal(lb.json.riders.find((r) => r.athlete_id === RIDER_ID).revoked, true);
   });
 

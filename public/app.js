@@ -14,9 +14,9 @@ import {
   SYNC_POLL_INTERVAL_MS,
   SYNC_POLL_MAX_MS,
   TEAMS,
-} from './config.js?v=1';
-import * as api from './api.js?v=1';
-import * as ui from './render.js?v=1';
+} from './config.js?v=2';
+import * as api from './api.js?v=2';
+import * as ui from './render.js?v=2';
 
 /* --------------------------------------------------------------- pure boot logic ---- */
 
@@ -195,10 +195,25 @@ const state = {
   me: null,
   /** @type {object|null} last /api/leaderboard payload */
   leaderboard: null,
+  /**
+   * `YYYY-MM` on screen, or null meaning "whatever the server calls current".
+   *
+   * Null is the BOOT value and is deliberately not replaced by a guess: the server owns
+   * which month is current in COMPETITION_TZ, and a client that derived it from its own
+   * clock would disagree with the picker on a laptop set to yesterday, or one timezone east
+   * of the configured one. It is filled in from the response, never from the reader's click,
+   * which is what makes a clamped month self-correcting.
+   * @type {string|null}
+   */
+  month: null,
+  /** @type {object|null} last `competition` block; the source of prev/next for stepping. */
+  competition: null,
   /** True while the rider still owes us a team; gates the dialog's reopen-on-close. */
   needsTeam: false,
   /** True while a sync (including its 409 wait) is in flight. */
   syncing: false,
+  /** True while a month change is in flight, so a double-click cannot race two loads. */
+  monthLoading: false,
 };
 
 const BANNER = Object.freeze({
@@ -214,13 +229,65 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* ------------------------------------------------------------------------ actions ---- */
 
-/** Fetch both boot endpoints, reduce, render. @returns {Promise<object>} the boot state */
-async function loadAll() {
+/**
+ * Fetch both boot endpoints, reduce, render.
+ *
+ * `options.board` lets a caller that ALREADY holds a fresh leaderboard payload skip
+ * re-fetching it. POST /api/me/sync embeds a whole board in its response precisely so
+ * Refresh is one round trip; without this, Refresh fetched that same board a second time and
+ * rendered the scoreboard and roster TWICE, which is both a wasted request and a visible
+ * double paint on the slowest interaction in the app.
+ *
+ * @param {{board?: object|null}} [options]
+ * @returns {Promise<object>} the boot state
+ */
+async function loadAll(options = {}) {
+  const board = options.board ?? null;
   // Both wrapped: settled, never awaited bare, so one failure cannot hide the other.
-  const [meResult, lbResult] = await Promise.allSettled([api.getMe(), api.getLeaderboard()]);
+  // `state.month` is passed to BOTH: /api/me carries the competition block too, and letting
+  // the two requests disagree about the month would render a June board under an August
+  // heading depending on which response resolved second.
+  const [meResult, lbResult] = await Promise.allSettled([
+    api.getMe(undefined, state.month),
+    board === null ? api.getLeaderboard(undefined, state.month) : Promise.resolve(board),
+  ]);
   const boot = resolveBootState(meResult, lbResult);
   applyBootState(boot);
   return boot;
+}
+
+/**
+ * Fetch and render ONLY the board, for a month change.
+ *
+ * Half the round trips of `loadAll`, because /api/me cannot tell us anything new here: who is
+ * signed in, their badges, their avatar and whether they still owe us a team are all
+ * month-independent. The one thing a month change does alter -- the `competition` block -- is
+ * carried by the leaderboard payload itself.
+ *
+ * Errors are thrown, not swallowed: `selectMonth` owns the retry banner and has to be able to
+ * roll `state.month` back to what is actually on screen.
+ *
+ * @returns {Promise<object>} the leaderboard payload
+ */
+async function loadBoard() {
+  const board = await api.getLeaderboard(undefined, state.month);
+
+  // A schema bump mid-session means this payload may not be safe to read. Hand off to the
+  // full path, which owns the "reload to update" banner rather than duplicating it here.
+  if (board?.schema !== undefined && board.schema !== API_SCHEMA) {
+    await loadAll({ board });
+    return board;
+  }
+
+  state.leaderboard = board;
+  if (board?.competition) {
+    state.competition = board.competition;
+    if (typeof board.competition.month === 'string') state.month = board.competition.month;
+    ui.renderCompetition(board.competition);
+  }
+  ui.renderScoreboard(board);
+  ui.renderRoster(board);
+  return board;
 }
 
 /** @param {object} boot output of resolveBootState */
@@ -228,6 +295,14 @@ function applyBootState(boot) {
   state.me = boot.me;
   state.leaderboard = boot.leaderboard;
   state.needsTeam = boot.showTeamPicker;
+
+  // Adopt the month the SERVER reports, not the one that was asked for. Asking for 2030-01
+  // and getting 2026-08 back has to leave `state.month` on 2026-08, or every subsequent
+  // Refresh and month step would keep re-sending the out-of-range value.
+  if (boot.competition !== null) {
+    state.competition = boot.competition;
+    if (typeof boot.competition.month === 'string') state.month = boot.competition.month;
+  }
 
   ui.renderIdentity(boot.me);
   if (boot.competition !== null) ui.renderCompetition(boot.competition);
@@ -330,6 +405,64 @@ function handleTeamPickerClosed() {
 }
 
 /**
+ * Switch the board to another month.
+ *
+ * Guarded by `state.monthLoading` rather than by disabling the control alone: the prev/next
+ * buttons are re-enabled by `renderMonthPicker` on every render, so a reader who clicks twice
+ * quickly can otherwise start two loads whose responses land in either order and leave the
+ * heading describing a different month than the rows beneath it.
+ *
+ * The requested month is NOT written to `state.month` here. `applyBootState` adopts whatever
+ * month the server reports instead, so an out-of-range request self-corrects to the clamped
+ * value rather than sticking around to be re-sent on the next Refresh.
+ *
+ * @param {string} month `YYYY-MM`
+ */
+async function selectMonth(month) {
+  if (typeof month !== 'string' || !/^\d{4}-\d{2}$/.test(month)) return;
+  if (state.monthLoading || state.syncing) return;
+  if (month === state.month) return;
+
+  state.monthLoading = true;
+  const previousMonth = state.month;
+  ui.setMonthPickerPending(true);
+  ui.removeBanner(BANNER.BOARD);
+  try {
+    state.month = month;
+    // ONE request, not two: see loadBoard. A month change is the most frequently repeated
+    // interaction in the app, so halving its round trips is the difference the reader feels.
+    await loadBoard();
+  } catch (error) {
+    state.month = previousMonth;
+    ui.showBanner({
+      id: BANNER.BOARD,
+      kind: 'error',
+      text: 'Could not load that month.',
+      actionLabel: 'Retry',
+      onAction: () => { selectMonth(month).catch(reportFatal); },
+    });
+  } finally {
+    state.monthLoading = false;
+    ui.setMonthPickerPending(false);
+  }
+}
+
+/**
+ * Step one month earlier or later.
+ *
+ * The target comes from the SERVER's `prev_month`/`next_month` rather than from local date
+ * arithmetic, so the ends of the range are wherever the server says they are and the client
+ * never has to know the bounds rule.
+ *
+ * @param {-1|1} direction
+ */
+function stepMonth(direction) {
+  const shaped = ui.shapeMonthPicker(state.competition);
+  const target = direction < 0 ? shaped.prev : shaped.next;
+  if (typeof target === 'string' && target !== '') selectMonth(target).catch(reportFatal);
+}
+
+/**
  * Refresh: POST /api/me/sync, whose response embeds a whole leaderboard payload, so this
  * is one round trip.
  * @param {{reason?: string}} [options]
@@ -343,18 +476,15 @@ async function refresh(options = {}) {
     ? 'Fetching your rides from Strava for the first time…'
     : 'Syncing your rides from Strava…');
   try {
-    const result = await api.syncNow();
+    // The month ON SCREEN goes with the sync, or the embedded board comes back for the
+    // server's current month and Refresh silently snaps the view from June to August.
+    const result = await api.syncNow(undefined, state.month);
     const board = result?.leaderboard ?? null;
-    if (board !== null) {
-      state.leaderboard = board;
-      if (board.competition) ui.renderCompetition(board.competition);
-      ui.renderScoreboard(board);
-      ui.renderRoster(board);
-      // /api/me carries the viewer's own last_synced_at and badges; cheap and worth it.
-      await loadAll();
-    } else {
-      await loadAll();
-    }
+    // Hand the embedded board straight to loadAll instead of rendering it here and then
+    // letting loadAll fetch and render it AGAIN. That double paint was the most visible
+    // stutter in the app, on its slowest interaction: three round trips and two full roster
+    // rebuilds where two round trips and one rebuild do the same work.
+    await loadAll({ board });
     ui.setStatus('Up to date.');
   } catch (error) {
     await handleSyncError(error);
@@ -405,7 +535,7 @@ async function waitOutRunningSync(error) {
     await sleep(SYNC_POLL_INTERVAL_MS);
     let board = null;
     try {
-      board = await api.getLeaderboard();
+      board = await api.getLeaderboard(undefined, state.month);
     } catch {
       // Keep polling until the deadline; a transient failure is not a reason to stop.
     }
@@ -506,6 +636,9 @@ export async function start() {
     },
     onRefresh: () => { refresh().catch(reportFatal); },
     onLogout: () => { doLogout().catch(reportFatal); },
+    onMonthChange: (month) => { selectMonth(month).catch(reportFatal); },
+    onMonthPrev: () => stepMonth(-1),
+    onMonthNext: () => stepMonth(1),
     onOpenTeamPicker: () => ui.openTeamPicker(),
     onChooseTeam: (team) => { chooseTeam(team).catch(reportFatal); },
     onTeamPickerClosed: handleTeamPickerClosed,

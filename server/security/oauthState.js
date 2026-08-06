@@ -40,9 +40,9 @@ import { ERROR_CODES, OAUTH_FRAGMENT_ERRORS, OAUTH_STATE_TTL_SECONDS, OAUTH_STAT
 const TTL_SECONDS = OAUTH_STATE_TTL_SECONDS;
 
 /**
- * Every failure here surfaces to the user as a browser redirect to
- * `WEB_ORIGIN/#error=state_expired`, never as JSON -- the caller is a top-level navigation
- * from Strava, not a fetch. `extra.fragment` carries the code for the route to use.
+ * Every failure here surfaces to the user as a browser redirect to the app root with
+ * `#error=state_expired`, never as JSON -- the caller is a top-level navigation from Strava,
+ * not a fetch. `extra.fragment` carries the code for the route to use.
  *
  * All failures deliberately share one message. Distinguishing "bad signature" from
  * "unknown state" from "wrong browser" would tell someone probing the callback exactly
@@ -193,7 +193,7 @@ function hasHostileChars(s) {
 }
 
 /**
- * Reduce an arbitrary caller-supplied value to a safe same-origin path, or '/'.
+ * Reduce an arbitrary caller-supplied value to a safe path inside the frontend, or the app root.
  *
  * This RESOLVES the value instead of pattern-matching it. The tempting
  * `v.startsWith('/') && !v.startsWith('//')` form is wrong in at least three ways that all
@@ -206,34 +206,50 @@ function hasHostileChars(s) {
  *     strip, so what is validated is not what is fetched.
  *
  * So: reject hostile characters in both the raw and the percent-decoded form, resolve
- * against WEB_ORIGIN, require an exact origin match, and reject a normalized result that is
+ * against the app root, require an exact origin match, and reject a normalized result that is
  * itself protocol-relative.
+ *
+ * `config.webBasePath` widens "safe" from same-origin to same-origin-AND-inside-the-app. On a
+ * Pages project site (`user.github.io/eastvswest/`) the origin is shared with every other
+ * project that account has published, so an origin check alone would happily redirect a
+ * freshly authenticated rider -- with `#token=` in the URL on the bearer path -- into somebody
+ * else's project. There is also no app to return to outside the base path: `/` is GitHub's
+ * 404 page. At a domain root `webBasePath` is `''` and this collapses to the origin check.
  */
 export function safeReturnTo(config, value) {
-  if (typeof value !== 'string' || value === '') return '/';
+  const basePath = typeof config?.webBasePath === 'string' ? config.webBasePath : '';
+  /** The app's front page. `/` at a domain root, `/eastvswest/` under a project site. */
+  const home = `${basePath}/`;
+
+  if (typeof value !== 'string' || value === '') return home;
 
   let decoded;
   try {
     decoded = decodeURIComponent(value);
   } catch {
     // Malformed percent-encoding. Never guess at what it was supposed to mean.
-    return '/';
+    return home;
   }
-  if (hasHostileChars(value) || hasHostileChars(decoded)) return '/';
+  if (hasHostileChars(value) || hasHostileChars(decoded)) return home;
 
   let u;
   try {
-    u = new URL(value, config.webOrigin);
+    // Resolved against the app ROOT, not the bare origin, so a relative `?month=2026-09`
+    // stays inside the project sub-path instead of silently landing on GitHub's 404.
+    u = new URL(value, `${config.webOrigin}${home}`);
   } catch {
-    return '/';
+    return home;
   }
   // Catches `https://evil.com` (different origin) and `javascript:alert(1)` (origin
   // 'null'). Comparing origins rather than hostnames also pins the scheme and the port.
-  if (u.origin !== config.webOrigin) return '/';
+  if (u.origin !== config.webOrigin) return home;
 
   const path = `${u.pathname}${u.search}`;
   // After normalization `/..//evil.com` is `//evil.com`, which becomes protocol-relative
   // the moment it lands in a Location header on its own.
-  if (!path.startsWith('/') || path.startsWith('//')) return '/';
+  if (!path.startsWith('/') || path.startsWith('//')) return home;
+  // Same origin but a different project on that origin. `path === basePath` is the app root
+  // without its trailing slash, which is legitimate.
+  if (basePath !== '' && path !== basePath && !path.startsWith(home)) return home;
   return path;
 }

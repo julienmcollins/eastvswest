@@ -22,11 +22,11 @@ import test, { describe } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import * as serverContracts from '../server/contracts.js';
-import * as api from '../public/api.js?v=1';
-import * as app from '../public/app.js?v=1';
-import * as config from '../public/config.js?v=1';
-import * as fmt from '../public/format.js?v=1';
-import * as render from '../public/render.js?v=1';
+import * as api from '../public/api.js?v=2';
+import * as app from '../public/app.js?v=2';
+import * as config from '../public/config.js?v=2';
+import * as fmt from '../public/format.js?v=2';
+import * as render from '../public/render.js?v=2';
 
 const here = (relative) => fileURLToPath(new URL(relative, import.meta.url));
 
@@ -35,6 +35,9 @@ const meFixtures = JSON.parse(await readFile(here('./fixtures/me.sample.json'), 
 const indexHtml = await readFile(here('../public/index.html'), 'utf8');
 const notFoundHtml = await readFile(here('../public/404.html'), 'utf8');
 const renderSource = await readFile(here('../public/render.js'), 'utf8');
+const appSource = await readFile(here('../public/app.js'), 'utf8');
+const apiSource = await readFile(here('../public/api.js'), 'utf8');
+const configSource = await readFile(here('../public/config.js'), 'utf8');
 const stylesCss = await readFile(here('../public/styles.css'), 'utf8');
 
 /** Wrap a value the way Promise.allSettled would on success. */
@@ -168,6 +171,10 @@ describe('config.js — the migration seam', () => {
     assert.deepEqual([...config.TEAMS], [...serverContracts.TEAMS]);
     assert.deepEqual({ ...config.TEAM_LABELS }, { ...serverContracts.TEAM_LABELS });
     assert.equal(config.CSRF_COOKIE, serverContracts.COOKIES.CSRF);
+    // The two caps must be EQUAL, not merely both present: the server trims first_month..last_month
+    // to its copy, so a smaller client copy silently offers fewer options than prev_month steps to,
+    // and a larger one lets a runaway server range through to the DOM.
+    assert.equal(config.MAX_PICKER_MONTHS, serverContracts.MAX_PICKER_MONTHS);
     assert.equal(leaderboard.schema, config.API_SCHEMA, 'fixture schema matches the client');
   });
 
@@ -225,7 +232,11 @@ describe('app.js resolveBootState — the Promise.allSettled unwrap', () => {
     assert.equal(boot.canRenderBoard, true, 'the leaderboard is public data; render it');
     assert.equal(boot.leaderboard, leaderboard);
     assert.equal(boot.meError, boom);
-    assert.equal(boot.competition.start, '2026-06-01');
+    // Identity against the fixture's own block, not a literal date: the property under test
+    // is "the LEADERBOARD's competition is the one used", which a hardcoded start date only
+    // ever tested by coincidence -- and which broke the moment the fixture moved to a month.
+    assert.equal(boot.competition, leaderboard.competition);
+    assert.equal(boot.competition.month, '2026-08');
   });
 
   test('a rejected leaderboard is reported without hiding the identity result', () => {
@@ -256,7 +267,10 @@ describe('app.js resolveBootState — the Promise.allSettled unwrap', () => {
       app.resolveBootState(fulfilled(meFixtures.authenticated), fulfilled(leaderboard)).schemaMismatch,
       false,
     );
-    const future = { ...leaderboard, schema: 2 };
+    // Derived from API_SCHEMA, never a literal. This test used `schema: 2` as its
+    // "impossibly future" value; the month picker then shipped API_SCHEMA = 2 and the
+    // assertion silently inverted -- it began proving that a MATCHING schema mismatches.
+    const future = { ...leaderboard, schema: config.API_SCHEMA + 1 };
     assert.equal(
       app.resolveBootState(fulfilled(meFixtures.authenticated), fulfilled(future)).schemaMismatch,
       true,
@@ -520,7 +534,10 @@ describe('render.js shapeScoreboard — the headline', () => {
 describe('render.js shapeCompetition — window and days remaining', () => {
   test('the window and the countdown are both present', () => {
     const shaped = render.shapeCompetition(leaderboard.competition);
-    assert.equal(shaped.rangeText, 'Jun 1 – Aug 31, 2026');
+    // A month, not a date span: every calendar month is its own competition now, so the
+    // masthead names the month rather than reciting a start and end date the reader already
+    // knows from the picker sitting underneath it.
+    assert.equal(shaped.rangeText, 'August 2026');
     assert.match(shaped.statusText, /28 days to go/);
     assert.match(shaped.timezoneText, /UTC/);
     assert.match(shaped.sportsText, /Ride, GravelRide, MountainBikeRide, VirtualRide/);
@@ -538,6 +555,79 @@ describe('render.js shapeCompetition — window and days remaining', () => {
   test('manual rides being countable is stated when the server says so', () => {
     const shaped = render.shapeCompetition({ ...leaderboard.competition, manual_rides_counted: true });
     assert.match(shaped.manualText, /admin/);
+  });
+});
+
+/* ================================================================= the month picker ==== */
+
+describe('render.js shapeMonthPicker — the control that got reported missing', () => {
+  test('the frozen fixture produces one option per month, oldest first, with the current one flagged', () => {
+    const shaped = render.shapeMonthPicker(leaderboard.competition);
+    assert.deepEqual(shaped.options.map((o) => o.month), ['2026-06', '2026-07', '2026-08']);
+    assert.deepEqual(shaped.options.map((o) => o.label), ['June 2026', 'July 2026', 'August 2026']);
+    assert.deepEqual(shaped.options.map((o) => o.current), [false, false, true]);
+    assert.equal(shaped.selected, '2026-08');
+    assert.equal(shaped.usable, true);
+    // Straight off the wire: null IS the disabled state, so the client does no arithmetic.
+    assert.equal(shaped.hasPrev, true);
+    assert.equal(shaped.hasNext, false);
+    assert.equal(shaped.next, null);
+  });
+
+  test('THE BUG: a single selectable month keeps the picker VISIBLE', () => {
+    // A one-month `COMPETITION_START`/`END` used to make `usable` false, which hid the control
+    // outright -- and a hidden control is indistinguishable from an unimplemented one, which is
+    // exactly how it was reported. The server-side union makes this rare; it stays legitimate for
+    // a genuinely single-month deployment, and it must still render.
+    const solo = render.shapeMonthPicker({
+      ...leaderboard.competition,
+      month: '2026-09',
+      first_month: '2026-09',
+      last_month: '2026-09',
+      current_month: '2026-09',
+      prev_month: null,
+      next_month: null,
+    });
+    assert.equal(solo.options.length, 1);
+    assert.equal(solo.usable, true, 'visible with one option and two dead arrows');
+    assert.equal(solo.hasPrev, false);
+    assert.equal(solo.hasNext, false);
+    assert.equal(solo.selected, '2026-09');
+  });
+
+  test('a payload with no months at all is the one case that hides it', () => {
+    // A stale or half-failed payload, not a deployment shape. An empty `<select>` is worse than
+    // no `<select>`, because it looks broken rather than absent.
+    for (const competition of [undefined, {}, { first_month: 'nope', last_month: null }]) {
+      const shaped = render.shapeMonthPicker(competition);
+      assert.deepEqual(shaped.options, []);
+      assert.equal(shaped.usable, false);
+    }
+  });
+
+  test('monthOptions walks the range inclusively and refuses an inverted one', () => {
+    assert.deepEqual(render.monthOptions('2026-11', '2027-02'), ['2026-11', '2026-12', '2027-01', '2027-02']);
+    assert.deepEqual(render.monthOptions('2026-08', '2026-08'), ['2026-08']);
+    // Inverted or malformed yields NO options rather than a loop that never terminates.
+    assert.deepEqual(render.monthOptions('2026-09', '2026-08'), []);
+    assert.deepEqual(render.monthOptions('august', '2026-08'), []);
+    assert.deepEqual(render.monthOptions(null, undefined), []);
+  });
+
+  test('the client cap trims the OLDEST months, so "now" survives a server that ignored its own', () => {
+    const options = render.monthOptions('1900-01', '2026-08');
+    assert.equal(options.length, config.MAX_PICKER_MONTHS);
+    assert.equal(options.at(-1), '2026-08', 'the newest month is kept');
+    assert.equal(options[0], '2016-09');
+  });
+
+  test('a selected month the range does not contain is added rather than silently dropped', () => {
+    // Only reachable if the server contradicts its own bounds. Dropping it would leave the
+    // <select> displaying a different month than the board beneath it, with nothing to see.
+    const shaped = render.shapeMonthPicker({ ...leaderboard.competition, month: '2027-01' });
+    assert.equal(shaped.selected, '2027-01');
+    assert.ok(shaped.options.some((o) => o.month === '2027-01'));
+    assert.deepEqual(shaped.options.map((o) => o.month), ['2026-06', '2026-07', '2026-08', '2027-01']);
   });
 });
 
@@ -596,8 +686,12 @@ describe('index.html — Pages migration and XSS guards', () => {
   test('GUARD: every path is relative — a root-absolute path 404s under a Pages subpath', () => {
     assert.doesNotMatch(indexHtml, /\ssrc="\//, 'root-absolute src');
     assert.doesNotMatch(indexHtml, /\shref="\/(?!\/)/, 'root-absolute href');
-    assert.match(indexHtml, /href="\.\/styles\.css\?v=1"/);
-    assert.match(indexHtml, /src="\.\/app\.js\?v=1"/);
+    // Derived from MODULE_VERSION rather than hardcoded. A literal here has to be edited in
+    // lockstep with every bump, and when it is missed the failure reads as "the cache-buster
+    // is broken" rather than "this assertion is stale" -- which is exactly how the v1 -> v2
+    // month-picker bump presented.
+    assert.match(indexHtml, new RegExp(`href="\\./styles\\.css\\?v=${config.MODULE_VERSION}"`));
+    assert.match(indexHtml, new RegExp(`src="\\./app\\.js\\?v=${config.MODULE_VERSION}"`));
     assert.match(indexHtml, /src="\.\/assets\/btn-strava-connect\.svg"/);
     assert.match(indexHtml, /src="\.\/assets\/powered-by-strava\.svg"/);
     for (const match of indexHtml.matchAll(/(?:src|href)="([^"]+)"/g)) {
@@ -624,6 +718,50 @@ describe('index.html — Pages migration and XSS guards', () => {
     assert.match(indexHtml, /frame-ancestors/, 'the meta-CSP limitation must be commented');
   });
 
+  test('DEPLOY GUARD: the CSP connect-src and the config.js API origins agree exactly', () => {
+    // docs/SPEC.md "Deferred to deploy time" item 4: the CSP must be widened to the API origin
+    // in LOCKSTEP with public/config.js, "same commit, or the site silently stops talking to
+    // its own API". Silently is the operative word -- a missing connect-src entry is a CSP
+    // violation in the console and a rejected fetch, with no 4xx and no CORS error, so the
+    // symptom is "the board never loads" with nothing to point at. This test is what makes a
+    // half-finished deploy edit fail here instead of in production.
+    const meta = /<meta http-equiv="Content-Security-Policy" content="([^"]+)"/.exec(indexHtml);
+    assert.ok(meta, 'meta CSP missing');
+    const connectSrc = /connect-src ([^;]+)/.exec(meta[1]);
+    assert.ok(connectSrc, 'CSP has no connect-src directive');
+
+    // Origins the CSP permits, beyond same-origin.
+    const cspOrigins = new Set(
+      connectSrc[1].trim().split(/\s+/).filter((token) => token !== "'self'"),
+    );
+
+    // Origins config.js will actually fetch from. Read as TEXT, not by importing: a commented
+    // -out production entry must not count, and that distinction is invisible after evaluation.
+    const configOrigins = new Set();
+    for (const line of configSource.split('\n')) {
+      const code = line.trim();
+      if (code.startsWith('//') || code.startsWith('*')) continue; // commented-out template
+      const entry = /:\s*'(https?:\/\/[^']+)'/.exec(code);
+      if (entry) configOrigins.add(entry[1]);
+    }
+
+    const missingFromCsp = [...configOrigins].filter((o) => !cspOrigins.has(o));
+    const missingFromConfig = [...cspOrigins].filter((o) => !configOrigins.has(o));
+
+    assert.deepEqual(
+      missingFromCsp,
+      [],
+      `public/config.js fetches from ${missingFromCsp.join(', ')} but the CSP connect-src does not allow it. `
+      + 'Add the origin to the <meta> CSP in BOTH public/index.html and public/404.html.',
+    );
+    assert.deepEqual(
+      missingFromConfig,
+      [],
+      `the CSP allows ${missingFromConfig.join(', ')} but public/config.js never fetches from it. `
+      + 'Either add the hostname mapping or narrow the CSP -- an unused allowance is a widened attack surface.',
+    );
+  });
+
   test('style-src self means no inline style attribute and no style block', () => {
     assert.doesNotMatch(indexHtml, /\sstyle="/, 'inline style attributes are blocked by the CSP');
     assert.doesNotMatch(indexHtml, /<style[\s>]/);
@@ -633,10 +771,15 @@ describe('index.html — Pages migration and XSS guards', () => {
   });
 
   test('module imports carry the ?v= cache-buster consistently', () => {
-    assert.match(indexHtml, /\.\/app\.js\?v=1/);
-    for (const file of [renderSource]) {
-      for (const match of file.matchAll(/from '\.\/([a-z]+\.js)([^']*)'/g)) {
-        assert.equal(match[2], '?v=1', `${match[1]} imported without the cache-buster`);
+    const v = `?v=${config.MODULE_VERSION}`;
+    assert.match(indexHtml, new RegExp(`\\./app\\.js\\?v=${config.MODULE_VERSION}`));
+    // app.js and api.js are checked too, not just render.js. The v1 -> v2 bump left app.js
+    // importing './config.js?v=1' while render.js imported './config.js?v=2', and because a
+    // query string makes a DISTINCT module URL the browser then evaluated config.js twice as
+    // two unrelated instances. Nothing threw, so only a check this broad catches it.
+    for (const [name, source] of [['render.js', renderSource], ['app.js', appSource], ['api.js', apiSource]]) {
+      for (const match of source.matchAll(/from '\.\/([a-z]+\.js)([^']*)'/g)) {
+        assert.equal(match[2], v, `${name} imports ${match[1]} with "${match[2]}", expected "${v}"`);
       }
     }
   });

@@ -3,7 +3,6 @@ import { createRouter } from './http/router.js';
 import { HttpError, sendError, sendJson } from './http/respond.js';
 import { corsHeaders, handlePreflight } from './http/cors.js';
 import { parseCookies } from './http/cookies.js';
-import { createStaticHandler } from './http/static.js';
 import { isoUtcNow } from './lib/dates.js';
 import { log } from './lib/log.js';
 
@@ -12,19 +11,37 @@ import { log } from './lib/log.js';
  *
  * It deliberately does NOT call listen(). server/index.js owns the socket, process signal
  * handlers, and the filesystem; this file is reused verbatim by the test harness (which
- * injects requests directly, because listen() is EPERM in the dev sandbox) and later by the
- * serverless adapter. Anything that needs a port belongs in index.js, not here.
+ * injects requests directly, because listen() is EPERM in the dev sandbox) and by
+ * server/worker.js. Anything that needs a port belongs in index.js, not here.
+ *
+ * IMPORTS NO NODE BUILTIN, directly or transitively. `http/static.js` is the one module that
+ * needs `node:fs`, and it is loaded through a lazy `import()` below rather than at the top of
+ * this file -- otherwise every Worker request would depend on a `node:fs` that is absent or
+ * partial on Workers depending on the compatibility date, for a code path a Worker never runs.
  *
  * @param {{config:object, db:object, routes?:object|null, publicDir?:string|null}} deps
  *   `routes` is a pre-built router from server/routes/index.js. When it is null the app
  *   serves only GET /api/health plus static files, which is enough for a smoke test.
+ *   `publicDir` must stay null in a Worker: Pages serves public/ there.
  * @returns {(req:object,res:object)=>Promise<void>}
  */
 export function buildApp({ config, db, routes = null, publicDir = null }) {
   if (!config) throw new TypeError('buildApp requires a config object.');
 
   const router = routes ?? healthOnlyRouter();
-  const staticHandler = publicDir ? createStaticHandler(publicDir, config) : null;
+
+  /**
+   * Load and build the static handler at most once, on the first request that gets past the
+   * router. Memoized as a PROMISE, not as a resolved value, so two concurrent misses cannot
+   * both start the import.
+   */
+  let staticHandlerPromise = null;
+  const getStaticHandler = () => {
+    if (!publicDir) return null;
+    staticHandlerPromise ??= import('./http/static.js')
+      .then(({ createStaticHandler }) => createStaticHandler(publicDir, config));
+    return staticHandlerPromise;
+  };
 
   return async function app(req, res) {
     const startedAt = Date.now();
@@ -90,6 +107,7 @@ export function buildApp({ config, db, routes = null, publicDir = null }) {
         throw new HttpError(404, ERROR_CODES.NOT_FOUND, `Unknown API endpoint: ${pathname}`);
       }
 
+      const staticHandler = await getStaticHandler();
       if (staticHandler && (await staticHandler(req, res))) return;
 
       throw new HttpError(404, ERROR_CODES.NOT_FOUND, `Not found: ${pathname}`);

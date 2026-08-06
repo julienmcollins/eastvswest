@@ -5,7 +5,7 @@ import { requireNotRevoked, requireSession } from '../security/guards.js';
 import { revokeAllForAthlete } from '../security/sessionStore.js';
 import { claimTeam, getAthlete, markDisconnected, deleteAthlete, normalizeAvatarUrl } from '../db/athletes.js';
 import { deleteTokens } from '../db/tokens.js';
-import { purgeAthleteActivities } from '../db/activities.js';
+import { purgeAthleteActivities, selectableMonthBounds } from '../db/activities.js';
 import { getSyncState } from '../db/syncState.js';
 import { buildLeaderboard } from '../db/leaderboard.js';
 import { getValidAccessToken } from '../strava/tokenService.js';
@@ -16,8 +16,9 @@ import {
   StravaRateLimitError,
   StravaScopeError,
 } from '../strava/client.js';
-import { competitionStatus, epochSeconds, isoFromEpoch, isoUtcNow, resolveWindow } from '../lib/dates.js';
+import { monthStatus, epochSeconds, isoFromEpoch, isoUtcNow } from '../lib/dates.js';
 import { clearAuthCookies } from './auth.js';
+import { requireMonthParam } from './leaderboard.js';
 
 /**
  * Everything scoped to "the rider making this request".
@@ -88,13 +89,20 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
   router.add('GET', '/api/me', async (req, res, ctx) => {
     const nowMs = ctx.nowMs ?? now();
     const athlete = ctx.athlete ?? null;
+    // Accepted so a deep-linked month renders one consistent masthead: the client sends the
+    // same `?month=` to both boot endpoints, and without it this block would describe a
+    // different month than the board rendered beside it.
+    const month = requireMonthParam(ctx.query.get('month'));
 
     sendJson(res, 200, {
       authenticated: athlete !== null,
       rider: athlete === null ? null : await riderView(db, athlete),
-      // The CONFIGURED season, not a requested window: `state` and `days_remaining` are
-      // season-level facts and are the same for everyone.
-      competition: competitionStatus(config, nowMs),
+      // One MONTH's race -- `state` and `days_remaining` belong to the selected month, and
+      // absent `?month=` means the current month in COMPETITION_TZ. The bounds are loaded from
+      // the database rather than left to default, or this block would advertise a NARROWER
+      // first_month/last_month than the board beside it and the two would disagree about how
+      // many options the picker has.
+      competition: monthStatus(config, month, nowMs, await selectableMonthBounds(db, config, nowMs)),
       server_time: isoUtcNow(nowMs),
       schema: API_SCHEMA,
     });
@@ -166,6 +174,12 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
       mode = body.mode;
     }
 
+    // The month the rider is LOOKING AT, not the month being synced. Sync itself always
+    // covers the whole picker range (one fetch serves every month), but the embedded
+    // leaderboard has to come back for the month on screen -- otherwise pressing Refresh
+    // while viewing June silently snaps the board to the current month.
+    const month = requireMonthParam(body.month);
+
     let result;
     try {
       result = await syncAthlete(db, config, strava, session.athleteId, { mode, nowMs });
@@ -174,7 +188,7 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
     }
 
     const leaderboard = await buildLeaderboard(db, config, {
-      window: resolveWindow(config, {}),
+      month,
       viewerAthleteId: session.athleteId,
       nowMs,
     });

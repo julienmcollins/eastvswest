@@ -96,18 +96,25 @@ export function buildRoutes({ config, db, strava, now = () => Date.now() }) {
  * Bearer first because it is the explicit choice: a client that attaches a token is asking
  * to act as that token's owner, and a stale `bc_sid` left over in the same browser must not
  * silently win. Both hash to the same `sessions` row, so there is one code path behind them.
+ *
+ * The PREFERENCE is also what makes the CSRF exemption in security/csrf.js safe -- see the
+ * comment there. Returning the source alongside the value, rather than letting the guard
+ * re-sniff the header, keeps the two from ever disagreeing about which credential was used.
+ *
+ * @returns {{raw: string|null, source: 'bearer'|'cookie'|null}}
  */
 function credentialFrom(req, cookies) {
   const header = req.headers?.authorization;
   if (typeof header === 'string') {
     const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-    if (match) return match[1].trim();
+    if (match) return { raw: match[1].trim(), source: 'bearer' };
   }
-  return cookies?.get(COOKIES.SESSION) ?? null;
+  const cookie = cookies?.get(COOKIES.SESSION) ?? null;
+  return { raw: cookie, source: cookie === null ? null : 'cookie' };
 }
 
 /**
- * Populate `ctx.session`, `ctx.athlete`, and `ctx.rawSessionToken`.
+ * Populate `ctx.session`, `ctx.athlete`, `ctx.rawSessionToken`, and `ctx.credentialSource`.
  *
  * Never throws for a bad credential. "Not logged in" is a valid state for /api/me and
  * /api/leaderboard, and turning an expired cookie into a 500 would break the anonymous
@@ -117,10 +124,14 @@ async function attachIdentity(ctx, { config, db, now }) {
   const nowMs = now();
   ctx.nowMs = nowMs;
 
-  const raw = credentialFrom(ctx.req, ctx.cookies);
+  const { raw, source } = credentialFrom(ctx.req, ctx.cookies);
   // Kept so logout can delete the row behind WHICHEVER credential matched. Clearing only
   // the cookie would leave the bearer path alive and make logout visibly fail.
   ctx.rawSessionToken = raw;
+  // Set even when the credential turns out to be invalid: requireCsrf runs before any
+  // route's requireSession, and it needs to know which credential was PRESENTED, not which
+  // one resolved.
+  ctx.credentialSource = source;
   if (!raw) return;
 
   const session = await resolveSession(db, config, raw, { nowMs });

@@ -1,0 +1,71 @@
+# Copy to `wrangler.toml` and fill in the IDs, or run `node scripts/deploy-setup.mjs`. See docs/DEPLOY.md.
+#
+# `wrangler.toml` is COMMITTED, so nothing secret goes in it. STRAVA_CLIENT_SECRET,
+# SESSION_SECRET and TOKEN_ENCRYPTION_KEY are set with `wrangler secret put <NAME>` and
+# arrive on the same `env` binding that loadConfig() already reads.
+
+# On the workers.dev path this name IS the first label of the hostname:
+# `<name>.<account>.workers.dev`.
+name = "bike-comp-api"
+main = "server/worker.js"     # the Worker entry (fetch handler). server/index.js is the Node one.
+compatibility_date = "2026-01-01" # [UNVERIFIED] set to the date you deploy
+compatibility_flags = ["nodejs_compat"]
+
+# ---- Routing: pick ONE of the two blocks below -----------------------------------------
+#
+# This section sits ABOVE every [table] on purpose. `workers_dev` is a TOP-LEVEL key, and in
+# TOML a bare key written after a `[[d1_databases]]` header belongs to THAT table instead --
+# so moving it down would silently give the Worker no hostname at all.
+#
+# A. CUSTOM DOMAIN (recommended). The API answers on the SAME registrable domain as the
+#    Pages site, so the session cookie is first-party and everything works with cookies
+#    alone. Leave AUTH_TOKEN_IN_FRAGMENT false in that case.
+[[routes]]
+pattern = "api.example.com/*"
+custom_domain = true
+
+# B. DEFAULT workers.dev SUBDOMAIN. Delete the [[routes]] block above and uncomment the line
+#    below instead. The Worker then answers on `<name>.<account>.workers.dev`, which is a
+#    DIFFERENT registrable domain from `user.github.io` -- so bc_sid and bc_csrf are both
+#    third-party cookies and AUTH_TOKEN_IN_FRAGMENT is mandatory, not optional.
+#    `<account>` is your Cloudflare workers.dev subdomain (Workers & Pages -> your account ->
+#    Subdomain), which need not match your GitHub username.
+# workers_dev = true
+
+# ---- D1 -------------------------------------------------------------------------------
+# Create with:  wrangler d1 create bike-comp        (paste the id it prints below)
+# Apply schema: wrangler d1 migrations apply bike-comp --remote
+[[d1_databases]]
+binding = "DB"                    # server/db/d1.js reads env.DB
+database_name = "bike-comp"
+database_id = "REPLACE_WITH_THE_ID_FROM_wrangler_d1_create"
+# NOT OPTIONAL. wrangler defaults this to `./migrations` relative to this file, and this
+# project keeps them under server/. Without it, `wrangler d1 migrations apply` fails with
+# "no migrations present at <root>/migrations" and no hint that the folder simply moved.
+# (server/db/migrate.js -- the local-dev path -- resolves the same folder from its own
+# module URL, so it never needed telling and this omission was invisible on Node.)
+migrations_dir = "server/migrations"
+
+# ---- Non-secret configuration ---------------------------------------------------------
+# Mirrors .env, minus the three secrets. DATABASE_PATH is absent on purpose: D1 replaces it.
+[vars]
+NODE_ENV = "production"           # load-bearing: this is what makes the cookies Secure
+APP_BASE_URL = "https://www.example.com"
+API_BASE_URL = "https://api.example.com"   # builds redirect_uri; match Strava's callback domain
+WEB_ORIGIN = "https://www.example.com"     # post-OAuth target and the only CORS allowlist entry
+# Sub-path the frontend is served under: "" for a custom domain at a domain root, "/<repo>"
+# for a GitHub Pages project site. Never fold this into WEB_ORIGIN -- an Origin header has no
+# path, so it would match nothing and 403 every mutating request.
+WEB_BASE_PATH = ""
+# Only for the workers.dev / github.io path, where cookies cannot work. Requires
+# SESSION_TTL_SECONDS <= 86400; the server refuses to boot otherwise.
+AUTH_TOKEN_IN_FRAGMENT = "false"
+STRAVA_CLIENT_ID = "269991"
+COMPETITION_START = "2026-09-01"
+COMPETITION_END = "2026-09-30"
+COMPETITION_TZ = "UTC"
+ALLOWED_SPORT_TYPES = "Ride,GravelRide,MountainBikeRide,VirtualRide"
+COUNT_MANUAL_ACTIVITIES = "false"
+ADMIN_BOOTSTRAP_ATHLETE_IDS = "180335297"
+SESSION_TTL_SECONDS = "2592000"
+SYNC_COOLDOWN_SECONDS = "60"

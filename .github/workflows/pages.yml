@@ -1,0 +1,68 @@
+name: Deploy public/ to GitHub Pages
+
+# Implements docs/SPEC.md "Deferred to deploy time" item 8.
+#
+# WHAT THIS DOES AND DOES NOT DEPLOY. GitHub Pages is static hosting: it publishes `public/`
+# and nothing else. It CANNOT run `server/` -- that is Node, node:sqlite, OAuth, sessions and
+# cookies. So this workflow ships the frontend only, and the site is non-functional until an
+# API is running somewhere else and `public/config.js` points at it. See docs/DEPLOY.md.
+#
+# `path: public` makes the artifact root BE public/, which is why every path in index.html is
+# relative: a root-absolute `/assets/...` 404s under a project-site subpath like
+# `user.github.io/bike-comp/`. test/frontend-contract.test.js asserts that invariant.
+
+on:
+  push:
+    branches: [main]
+    # Frontend-only paths. The workflow file itself is included so a change to THIS file can
+    # be deployed without an unrelated public/ edit to piggyback on.
+    paths:
+      - 'public/**'
+      - '.github/workflows/pages.yml'
+  # The first ever run needs this: `paths` above means a push that touched nothing under
+  # public/ will not trigger a deploy, which reads as "the workflow is broken" on day one.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. Not `cancel-in-progress: true`: cancelling a half-finished Pages
+# deployment can leave the site serving a partially-swapped artifact.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # A separate gate job, so a broken frontend contract fails BEFORE anything is published
+  # rather than after. `npm test` needs no install step: this project has zero dependencies.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Must satisfy the `engines.node` floor in package.json (>=26).
+          node-version: '26'
+      - name: Run the test suite
+        run: npm test
+      - name: 404.html must be a byte-for-byte copy of index.html
+        # Pages has no SPA fallback, so 404.html is the only thing a deep link gets. The test
+        # suite already asserts this; repeated here so the failure names the cause directly.
+        run: cmp public/index.html public/404.html
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deployment
+        uses: actions/deploy-pages@v4

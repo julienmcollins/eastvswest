@@ -15,6 +15,9 @@ import { COOKIES, ERROR_CODES } from '../contracts.js';
  *      cross-site request and script cannot forge it.
  *   3. `X-CSRF-Token` matching the `bc_csrf` cookie (double-submit) — a custom header
  *      cannot be sent cross-origin at all without passing a CORS preflight we control.
+ *      Skipped, and only skipped, for a caller that authenticated with `Authorization:
+ *      Bearer` rather than the cookie; the long comment on that branch explains why that is
+ *      not a hole and why the cross-site deploy is unusable without it.
  *
  * WHY BUILD THIS NOW, when `SameSite=Lax` already covers most of it? Because at deploy time
  * the frontend moves to its own origin, and that single change removes SameSite's protection
@@ -77,9 +80,11 @@ function csrfFailed(reason) {
  *
  * @param {import('node:http').IncomingMessage} req
  * @param {object} config
- * @param {{cookies: Map<string,string>|Record<string,string>}} ctx
+ * @param {{cookies: Map<string,string>|Record<string,string>, credentialSource?: 'bearer'|'cookie'|null}} ctx
+ *   `credentialSource` is set by attachIdentity in routes/index.js and says which credential
+ *   the caller PRESENTED. See leg 3.
  */
-export function requireCsrf(req, config, { cookies } = {}) {
+export function requireCsrf(req, config, { cookies, credentialSource = null } = {}) {
   const headers = req?.headers ?? {};
 
   // --- 1. Content type. ---
@@ -102,7 +107,29 @@ export function requireCsrf(req, config, { cookies } = {}) {
     throw csrfFailed(`origin:${origin || 'absent'}`);
   }
 
-  // --- 3. Double-submit token. ---
+  // --- 3. Double-submit token, unless the caller authenticated with a bearer token. ---
+  //
+  // WHY THE EXEMPTION IS NOT A HOLE. CSRF exists because the browser attaches cookies to
+  // cross-site requests all by itself, so an attacker's page can spend the victim's
+  // credential without ever reading it. A bearer token is the opposite: it is attached only
+  // by our own script, which read it out of `localStorage` on the frontend's origin. An
+  // attacker's page cannot read that storage (it is origin-scoped) and cannot forge the
+  // header (`Authorization` is not CORS-safelisted, so the request preflights first and leg 2
+  // above decides who clears it). There is nothing ambient left to forge.
+  //
+  // AND IT CANNOT BE USED TO SKIP THE CHECK ON A COOKIE SESSION, which is the obvious attack
+  // on an exemption like this. `credentialFrom` in routes/index.js PREFERS the bearer header,
+  // so a request carrying `Authorization: Bearer <garbage>` plus the victim's cookies
+  // resolves to no session at all rather than falling back to the cookie -- the request is
+  // anonymous and every mutating route's requireSession answers 401.
+  //
+  // The exemption is what makes the cross-site deploy usable: with the API on a different
+  // registrable domain, `bc_csrf` is a third-party cookie the browser never returns, so
+  // `readCookie` in public/api.js finds nothing, no `X-CSRF-Token` is sent, and WITHOUT this
+  // branch every POST -- team pick, sync, logout -- 403s with `token_absent` on a deploy that
+  // otherwise looks healthy.
+  if (credentialSource === 'bearer') return;
+
   const headerToken = headers['x-csrf-token'];
   const cookieToken = cookieValue(cookies, COOKIES.CSRF);
   // safeEqual compares lengths FIRST -- node's timingSafeEqual throws

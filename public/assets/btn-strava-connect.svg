@@ -20,5 +20,15 @@
     <path d="M9.6 0 3.2 12.6h3.8L9.6 7.5l2.6 5.1H16z"/>
     <path d="M12.2 12.6 9.6 17.7 7 12.6H4.3l5.3 10.4 5.3-10.4z" opacity="0.85"/>
   </g>
-  <text x="48" y="30" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#FFFFFF">Connect with Strava</text>
+  <!--
+    `textLength` + `lengthAdjust` are load-bearing, not decoration. The label previously
+    overflowed the 193-wide viewBox and was clipped at the right edge: 19 glyphs of
+    Helvetica semibold at 15px measure ~153 units, and starting at x=48 that ends at ~201.
+    Dropping to 13px and x=44 makes it fit on Helvetica/Arial, but this SVG renders with
+    whatever font the VIEWER has, and a wider fallback (DejaVu Sans on Linux is ~10%
+    wider) would clip again. Pinning the advance width makes fitting a property of the
+    file rather than a property of the machine that opens it.
+  -->
+  <text x="44" y="30" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#FFFFFF"
+        textLength="137" lengthAdjust="spacingAndGlyphs">Connect with Strava</text>
 </svg>

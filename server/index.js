@@ -122,9 +122,13 @@ async function main() {
     web_origin: config.webOrigin,
     redirect_uri: config.redirectUri,
     node_env: config.nodeEnv,
-    // Printed at boot because it is the single most common misconfiguration: the competition
-    // window silently excluding every ride anyone has done.
-    competition: `${config.competitionStart} .. ${config.competitionEnd} (${config.competitionTz})`,
+    // Printed at boot because COMPETITION_START/END used to be the whole picker range, and the
+    // single most common misconfiguration was setting them to a window that excluded the month
+    // every ride anyone had done falls in. They are now only the FLOOR of that range -- the live
+    // range also includes the current month and every month holding data, and /api/leaderboard
+    // reports it as first_month/last_month -- so this line is what to compare against when a
+    // month you expected is missing. Months, not the raw dates, because months are selectable.
+    configured_months: `${config.competitionFirstMonth} .. ${config.competitionLastMonth} (${config.competitionTz})`,
     allowed_sport_types: config.allowedSportTypes,
     manual_rides_counted: config.countManualActivities,
     routes: routes.list().length,

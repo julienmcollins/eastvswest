@@ -1,5 +1,5 @@
-import { placeholders } from './db.js';
-import { isoUtcNow } from '../lib/dates.js';
+import { placeholders } from './bind.js';
+import { isoUtcNow, monthBounds } from '../lib/dates.js';
 
 /**
  * The activities table: writes from sync, reads for the per-rider ride list.
@@ -271,4 +271,58 @@ export async function maxStartEpoch(db, athleteId) {
     [athleteId],
   );
   return Number(row.max_epoch);
+}
+
+/**
+ * Lexical date bounds that match EVERY row, used to reuse `countedPredicate` with its date test
+ * neutralized. `local_date` is TEXT in `YYYY-MM-DD` form, so these compare correctly as strings
+ * -- which is the same property the whole month layer relies on. Not `'0000-00-00'`/`'9999-99-99'`
+ * because those are not dates at all and would read as a typo the first time somebody greps them.
+ */
+const ALL_DATES = Object.freeze({ start: '0000-01-01', end: '9999-12-31' });
+
+/**
+ * The first and last month that actually HOLD a ride the board would count.
+ *
+ * This is what widens the month picker past the configured season. Sync stores every activity it
+ * fetches regardless of the window (server/strava/sync.js rule 1) and the fetch window is padded
+ * by a day on both ends, so rides genuinely do land outside `COMPETITION_START..END` -- and
+ * before this query existed, those months were unreachable in the UI with no hint that they held
+ * data.
+ *
+ * The predicate is the SHARED `countedPredicate` with only its date test opened up, so "a month
+ * is offered" means exactly "a ride in it would appear on that month's board". A plain
+ * `MIN/MAX(local_date)` instead would open months whose only rows are a Run, a soft-deleted ride
+ * or an unapproved manual entry -- months guaranteed to render an empty board.
+ *
+ * `substr(local_date,1,7)` rather than any date function: `local_date` is generated from
+ * `start_date_local`, a wall clock carrying a bogus trailing Z, so slicing it is the only reading
+ * that keeps an Auckland 00:30-local ride in the month the rider rode it.
+ *
+ * @returns {Promise<{first: string|null, last: string|null}>} nulls when nothing is stored yet
+ */
+export async function activityMonthExtent(db, config) {
+  const counted = countedPredicate(config, ALL_DATES);
+  const row = await db.get(
+    `SELECT MIN(substr(ac.local_date, 1, 7)) AS first_month,
+            MAX(substr(ac.local_date, 1, 7)) AS last_month
+       FROM activities ac
+      WHERE ${counted.sql}`,
+    counted.params,
+  );
+  return { first: row?.first_month ?? null, last: row?.last_month ?? null };
+}
+
+/**
+ * The picker's month bounds for THIS request: the union of stored data, the current month, and
+ * the configured season. One extra `MIN/MAX` per request, which the
+ * `(local_date, sport_type, athlete_id)` index serves without touching the table.
+ *
+ * Every request-serving path must go through here rather than calling `monthBounds` directly:
+ * `monthBounds` defaults to the config-plus-clock range when it is handed no data, and that
+ * narrower range is exactly the bug -- it silently answers a request for a month that has rides
+ * with a different month's board, and hides the picker outright on a one-month `.env`.
+ */
+export async function selectableMonthBounds(db, config, nowMs = Date.now()) {
+  return monthBounds(config, nowMs, await activityMonthExtent(db, config));
 }

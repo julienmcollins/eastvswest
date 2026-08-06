@@ -2,6 +2,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
+import { assertStatement, bindables, placeholders, toBindable } from './bind.js';
+
 /**
  * THE database adapter. Every other module talks to SQLite exclusively through this
  * interface, and never imports node:sqlite directly.
@@ -23,38 +25,10 @@ import { mkdirSync } from 'node:fs';
  */
 
 /**
- * Coerce a JS value into something SQLite will accept, or throw loudly.
- *
- * This is the single most important guard in the file. Verified on Node v26.3.0:
- * binding a JS boolean or `undefined` throws "Provided value cannot be bound to SQLite
- * parameter N". Strava's JSON is full of booleans (`trainer`, `manual`, `private`) and
- * missing fields, so without this every activity insert fails -- and pure mapper unit
- * tests never catch it, because the failure only happens at bind time.
+ * Re-exported so `openDatabase`'s callers keep one import site. The definitions live in
+ * ./bind.js because server/db/d1.js needs them too and must not touch node:sqlite.
  */
-export function toBindable(value, index = 0) {
-  if (value === null || value === undefined) return null;
-  switch (typeof value) {
-    case 'boolean':
-      return value ? 1 : 0;
-    case 'number':
-      if (!Number.isFinite(value)) {
-        throw new TypeError(`Parameter ${index} is ${String(value)}; refusing to store a non-finite number.`);
-      }
-      return value;
-    case 'bigint':
-    case 'string':
-      return value;
-    default:
-      throw new TypeError(
-        `Parameter ${index} has unsupported type ${typeof value}. ` +
-          `Only null, boolean, number, bigint, and string can be bound.`,
-      );
-  }
-}
-
-function bindables(params) {
-  return params.map((p, i) => toBindable(p, i));
-}
+export { toBindable, placeholders };
 
 /**
  * Open the database and apply connection-level pragmas.
@@ -89,18 +63,6 @@ export function openDatabase(path, { readOnly = false } = {}) {
 }
 
 function wrap(raw, path) {
-  const assertSingle = (sql) => {
-    // A stray semicolon means a second statement silently never runs on some drivers.
-    if (sql.replace(/;\s*$/, '').includes(';')) {
-      throw new Error(`db: one statement per call. Use batch() for multiple:\n${sql}`);
-    }
-    // node:sqlite treats an array of params as NAMED parameters, so a named placeholder
-    // here silently fails to bind rather than erroring usefully.
-    if (/[:@$][A-Za-z_]/.test(sql)) {
-      throw new Error(`db: positional ? placeholders only, found a named parameter:\n${sql}`);
-    }
-  };
-
   return {
     path,
     /** The underlying handle. Only migrate.js and tests should reach for this. */
@@ -108,19 +70,19 @@ function wrap(raw, path) {
 
     /** @returns {Promise<object[]>} all matching rows as plain objects */
     async all(sql, params = []) {
-      assertSingle(sql);
+      assertStatement(sql);
       return raw.prepare(sql).all(...bindables(params));
     },
 
     /** @returns {Promise<object|undefined>} the first row, or undefined */
     async get(sql, params = []) {
-      assertSingle(sql);
+      assertStatement(sql);
       return raw.prepare(sql).get(...bindables(params));
     },
 
     /** @returns {Promise<{changes:number,lastInsertRowid:number}>} */
     async run(sql, params = []) {
-      assertSingle(sql);
+      assertStatement(sql);
       const r = raw.prepare(sql).run(...bindables(params));
       return { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) };
     },
@@ -137,7 +99,7 @@ function wrap(raw, path) {
     async batch(statements) {
       if (!Array.isArray(statements)) throw new TypeError('batch() expects an array of [sql, params].');
       if (statements.length === 0) return [];
-      for (const [sql] of statements) assertSingle(sql);
+      for (const [sql] of statements) assertStatement(sql);
 
       raw.exec('BEGIN IMMEDIATE');
       try {
@@ -166,16 +128,4 @@ function wrap(raw, path) {
       raw.close();
     },
   };
-}
-
-/**
- * Build `?,?,?` for an IN clause from the actual array length.
- *
- * Always use this instead of a hardcoded `IN (?,?,?,?)`: ALLOWED_SPORT_TYPES is
- * configurable, so a hardcoded arity breaks silently the moment someone sets three or
- * five sport types -- the query still runs, it just stops matching.
- */
-export function placeholders(n) {
-  if (!Number.isInteger(n) || n < 1) throw new RangeError(`placeholders(${n}): need at least one.`);
-  return new Array(n).fill('?').join(',');
 }

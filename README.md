@@ -153,6 +153,8 @@ server/     The API. The only place the Strava client secret exists.
 scripts/    keygen, make-admin, reset-db, strava-probe.
 test/       node:test suites plus the fake Strava and frozen contract fixtures.
 docs/SPEC.md  The full design spec, including every rejected alternative and why.
+docs/GOING-LIVE.md  Step-by-step walkthrough for putting this online, in plain language.
+docs/DEPLOY.md      The deploy reference: every variable, both hosting shapes, verification.
 ```
 
 ## Security notes
@@ -165,17 +167,28 @@ cookie — signing alone does not stop login CSRF. Full checklist in `docs/SPEC.
 The client secret never reaches the browser and is never logged; a test asserts a sentinel secret
 appears in no response body and no log line.
 
-## Deploying later
+## Deploying
 
-`public/` is ready for GitHub Pages as-is. The API needs a host that can hold a secret —
-Cloudflare Workers + D1 is the intended target.
+**Start here: [`docs/GOING-LIVE.md`](docs/GOING-LIVE.md)** — a step-by-step walkthrough, in plain
+language, for the free hosting route. [`docs/DEPLOY.md`](docs/DEPLOY.md) is the reference behind
+it, and `node scripts/deploy-setup.mjs --dry-run` shows you every edit before it makes one.
 
-**Read the "Deferred to deploy time" section of `docs/SPEC.md` before you start.** The short
-version: put the site and the API on **one registrable domain** (`www.example.com` +
-`api.example.com`). The obvious free setup — Pages on `username.github.io` plus a Worker on
-`workers.dev` — is broken by browser policy, not by configuration: the session cookie becomes
-third-party, Safari blocks it outright, and every `/api/*` call returns 401 forever with no CORS
-error to debug. A bearer-token fallback is already built in if you would rather not buy a domain.
+`public/` deploys to GitHub Pages unchanged. The API needs a host that can hold a secret;
+Cloudflare Workers + D1 is the target, and the port is written — `server/db/d1.js` and
+`server/worker.js`, with `server/index.js` still there for `npm start`.
+
+There are two supported shapes, and the choice changes how sessions work:
+
+- **One registrable domain** (`www.example.com` + `api.example.com`) — recommended. The session
+  cookie stays first-party and nothing else changes. This is the only shape where the session
+  credential is unreadable by page script.
+- **The free hosts** (`user.github.io` + `<worker>.<account>.workers.dev`). These are different
+  registrable domains, so the session cookie becomes third-party: Safari's ITP blocks it outright
+  and Chrome partitions it. Not a configuration gap — browser policy. This shape therefore runs
+  with `AUTH_TOKEN_IN_FRAGMENT=true`, handing the session token over in the callback's URL
+  fragment for `localStorage`, with sessions shortened to 12 h. It works, and it costs you
+  something real: `localStorage` is keyed per origin, so every other project published on that
+  `github.io` account can read the token. `docs/GOING-LIVE.md` spells the trade-off out.
 
 ## Strava attribution
 

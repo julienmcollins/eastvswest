@@ -34,7 +34,7 @@
 <!-- Every path in this file is RELATIVE. At deploy time the Pages artifact root IS
      public/, so a root-absolute "/styles.css" 404s under a project-site subpath. -->
 <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="./styles.css?v=1">
+<link rel="stylesheet" href="./styles.css?v=2">
 </head>
 <body>
 
@@ -51,6 +51,25 @@
       <span id="window-status" class="window-status">…</span>
     </p>
     <p id="window-meta" class="window-meta"></p>
+
+    <!--
+      The month picker. Every calendar month is its own competition, so this is the primary
+      navigation for the whole board, not a filter.
+
+      Starts `hidden` only because it has no options until the first payload lands; an empty
+      `<select>` on first paint reads as a broken control. renderMonthPicker un-hides it as soon
+      as the server offers a month -- including when it offers exactly ONE, because a hidden
+      picker is indistinguishable from an unimplemented one, and that is how this control got
+      reported missing. The <select> is the real control and the two buttons are a convenience,
+      which is why the buttons are `disabled` at the ends of the range rather than hidden -- a
+      control that vanishes moves its neighbours sideways on every click.
+    -->
+    <div id="month-picker" class="month-picker" hidden>
+      <button type="button" id="btn-month-prev" class="btn btn-sm" aria-label="Previous month">&#9664;</button>
+      <label class="month-picker-label" for="month-select">Month</label>
+      <select id="month-select" class="select" aria-label="Competition month"></select>
+      <button type="button" id="btn-month-next" class="btn btn-sm" aria-label="Next month">&#9654;</button>
+    </div>
   </div>
 
   <div class="masthead-actions">
@@ -253,7 +272,7 @@
      step. The ?v= query is bumped whenever the API contract changes so a stale cached
      module can never be paired with a new payload shape. Every module app.js imports
      carries the same marker. -->
-<script type="module" src="./app.js?v=1"></script>
+<script type="module" src="./app.js?v=2"></script>
 
 </body>
 </html>

@@ -18,7 +18,7 @@
  * this module in Node with no DOM at all.
  */
 
-import { TEAMS, TEAM_LABELS } from './config.js?v=1';
+import { MAX_PICKER_MONTHS, TEAMS, TEAM_LABELS } from './config.js?v=2';
 import {
   AVATAR_FALLBACK,
   EM_DASH,
@@ -32,7 +32,7 @@ import {
   safeAvatar,
   safeHref,
   teamLabel,
-} from './format.js?v=1';
+} from './format.js?v=2';
 
 /* ------------------------------------------------------------------ pure shaping ---- */
 
@@ -132,11 +132,16 @@ export function shapeScoreboard(leaderboard) {
   const totalMiles = Number(totals.miles) || 0;
   const leader = data.leader ?? null;
   const tie = leader === null;
+  const monthState = data.competition?.state;
 
   let leaderText;
   if (tie && totalMiles === 0) {
-    // Not a dramatic dead heat — nobody has ridden yet. Say so.
-    leaderText = 'No miles on the board yet. Everything is still up for grabs.';
+    // An empty board is no longer only "day one". With a month picker any finished month with
+    // no rides is one click away, and "everything is still up for grabs" would be a lie about
+    // a race that is already over -- so the wording follows the month's own state.
+    if (monthState === 'closed') leaderText = 'Nobody logged a ride this month.';
+    else if (monthState === 'upcoming') leaderText = 'This month has not started yet.';
+    else leaderText = 'No miles on the board yet. Everything is still up for grabs.';
   } else if (tie) {
     leaderText = `Dead heat — ${cards[0].label} and ${cards[1].label} are level at ${cards[0].milesText} mi.`;
   } else {
@@ -161,13 +166,83 @@ export function shapeScoreboard(leaderboard) {
   };
 }
 
+/* ---------------------------------------------------------------------- the month ---- */
+
+const MONTH_RE = /^(\d{4})-(\d{2})$/;
+
+/** Long month names, for the picker's option labels. `Jan`/`Feb` in format.js are for dates. */
+const MONTH_NAMES = Object.freeze([
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+]);
+
 /**
- * Shape the competition window line.
+ * `"2026-08"` -> `"August 2026"`. TOTAL: returns the input unchanged for anything it cannot
+ * read, because this labels the `<option>` a reader has to click and a thrown error here
+ * would leave the picker with no options at all.
+ *
+ * @param {unknown} month
+ * @returns {string}
+ */
+export function monthLabel(month) {
+  const m = MONTH_RE.exec(String(month ?? ''));
+  if (!m) return typeof month === 'string' && month !== '' ? month : EM_DASH;
+  const index = Number(m[2]) - 1;
+  if (index < 0 || index > 11) return String(month);
+  return `${MONTH_NAMES[index]} ${m[1]}`;
+}
+
+/**
+ * Every selectable month from `first` to `last`, inclusive, oldest first.
+ *
+ * Arithmetic on the STRING, never on a Date: `new Date('2026-08')` is midnight UTC and
+ * formats as July for anyone west of Greenwich, which is exactly the class of bug that
+ * `format.js`'s `shortDate` also exists to avoid. A month is a label, not an instant.
+ *
+ * Capped at MAX_PICKER_MONTHS from the LAST month backwards, so the months nearest now survive.
+ * The server caps its own range with the mirrored constant in server/contracts.js, so reaching
+ * this limit means the server ignored its cap -- the guard stays because a corrupt
+ * `start_date_local` in one activity row can widen the server's range without anyone editing
+ * config, and twelve thousand DOM nodes on first paint is a blank page, not a slow one.
+ *
+ * @param {unknown} first `YYYY-MM`
+ * @param {unknown} last `YYYY-MM`
+ * @returns {string[]}
+ */
+export function monthOptions(first, last) {
+  const lo = MONTH_RE.test(String(first ?? '')) ? String(first) : null;
+  const hi = MONTH_RE.test(String(last ?? '')) ? String(last) : null;
+  if (lo === null || hi === null || hi < lo) return [];
+
+  const out = [];
+  // Walk down from `hi`, then reverse: that is what makes the cap drop the OLDEST months.
+  let cursor = hi;
+  while (cursor >= lo && out.length < MAX_PICKER_MONTHS) {
+    out.push(cursor);
+    cursor = stepMonth(cursor, -1);
+  }
+  return out.reverse();
+}
+
+/** @param {string} month @param {number} delta @returns {string} */
+function stepMonth(month, delta) {
+  const m = MONTH_RE.exec(month);
+  const year = Number(m[1]);
+  const index = Number(m[2]) - 1 + delta;
+  // Math on integers rather than Date, so no timezone can get involved. Floor division is
+  // what makes January - 1 roll back to the previous December instead of month -1.
+  const yearShift = Math.floor(index / 12);
+  const normalized = index - yearShift * 12;
+  return `${String(year + yearShift).padStart(4, '0')}-${String(normalized + 1).padStart(2, '0')}`;
+}
+
+/**
+ * Shape the competition line for the SELECTED MONTH.
  * @param {object} competition the `competition` object from /api/me or /api/leaderboard
  */
 export function shapeCompetition(competition) {
   const c = competition ?? {};
-  const range = dateRange(c.start, c.end);
+  const month = typeof c.month === 'string' ? c.month : '';
   const days = Number(c.days_remaining);
   let statusText;
   if (c.state === 'upcoming') statusText = 'Not started yet';
@@ -175,7 +250,11 @@ export function shapeCompetition(competition) {
   else if (Number.isFinite(days)) statusText = days === 0 ? 'Last day' : plural(days, 'day') + ' to go';
   else statusText = 'In progress';
   return {
-    rangeText: range,
+    month,
+    // The month IS the competition, so its name is the headline. `dateRange` stays as the
+    // fallback for a payload with no `month` -- a stale cached module paired with a new
+    // server shows the dates rather than an em-dash.
+    rangeText: month !== '' ? monthLabel(month) : dateRange(c.start, c.end),
     statusText,
     timezoneText: typeof c.timezone === 'string' && c.timezone !== '' ? `dates in ${c.timezone}` : '',
     sportsText: Array.isArray(c.allowed_sport_types) && c.allowed_sport_types.length > 0
@@ -188,10 +267,64 @@ export function shapeCompetition(competition) {
   };
 }
 
+/**
+ * Shape the month picker: the options, the selection, and whether prev/next are live.
+ *
+ * `prev_month`/`next_month` come straight off the wire rather than being derived from the
+ * option list, because the server is the only side that knows the bounds for certain -- and
+ * `null` from it IS the disabled state, so there is no arithmetic here to get wrong.
+ *
+ * @param {object} competition
+ * @returns {{options: {month: string, label: string, current: boolean}[], selected: string,
+ *            prev: string|null, next: string|null, hasPrev: boolean, hasNext: boolean,
+ *            usable: boolean}}
+ */
+export function shapeMonthPicker(competition) {
+  const c = competition ?? {};
+  const selected = typeof c.month === 'string' ? c.month : '';
+  const current = typeof c.current_month === 'string' ? c.current_month : '';
+  const months = monthOptions(c.first_month, c.last_month);
+
+  // A selected month absent from the list would leave the <select> showing the wrong value
+  // silently, so it is added rather than dropped. Only reachable if the server ever emits a
+  // month outside its own bounds; belt and braces, because the alternative is invisible.
+  if (selected !== '' && !months.includes(selected)) {
+    months.push(selected);
+    months.sort();
+  }
+
+  const prev = typeof c.prev_month === 'string' ? c.prev_month : null;
+  const next = typeof c.next_month === 'string' ? c.next_month : null;
+
+  return {
+    options: months.map((month) => ({ month, label: monthLabel(month), current: month === current })),
+    selected,
+    prev,
+    next,
+    hasPrev: prev !== null,
+    hasNext: next !== null,
+    // Visible whenever the server offered ANY month. It deliberately does NOT hide itself on a
+    // single-month range any more: hiding is indistinguishable from the feature not existing,
+    // which is exactly how this control got reported missing on a one-month `.env`. A lone
+    // option with two dead arrows is honest about a one-month deployment, and because every
+    // calendar month is its own competition the list grows on its own from there. Zero options
+    // -- a payload with no first_month/last_month at all -- is the one case worth hiding.
+    usable: months.length > 0,
+  };
+}
+
 /* ------------------------------------------------------------------- DOM plumbing ---- */
 
 /** @type {Record<string, Element|null>|null} */
 let cache = null;
+
+/**
+ * Signature of the `<option>` list currently in the month `<select>`, so an identical list is
+ * not rebuilt. Reset alongside `cache`, because a new DOM means a new, empty `<select>` and a
+ * stale signature would skip the one rebuild that IS needed.
+ * @type {string|null}
+ */
+let monthOptionsSignature = null;
 
 /** Lazily resolve and cache every element we write to. Throws only if called with no DOM. */
 function dom() {
@@ -208,6 +341,11 @@ function dom() {
     windowRange: byId('window-range'),
     windowStatus: byId('window-status'),
     windowMeta: byId('window-meta'),
+
+    monthPicker: byId('month-picker'),
+    monthSelect: byId('month-select'),
+    monthPrev: byId('btn-month-prev'),
+    monthNext: byId('btn-month-next'),
 
     scoreboard: byId('scoreboard'),
     splitBar: byId('split-bar'),
@@ -254,6 +392,9 @@ function dom() {
 /** Test/teardown hook: forget the cached element references. */
 export function resetDomCache() {
   cache = null;
+  // Must be cleared with it: the signature describes the OLD <select>'s contents, and keeping
+  // it would make the first render against a fresh DOM skip building any options at all.
+  monthOptionsSignature = null;
 }
 
 /** @param {Element|null} el @param {string} text */
@@ -274,7 +415,7 @@ function setFlag(el, name, on) {
 /* ------------------------------------------------------------------- DOM writers ---- */
 
 /**
- * Render the masthead competition window.
+ * Render the masthead competition line for the selected month, and the picker with it.
  * @param {object} competition
  */
 export function renderCompetition(competition) {
@@ -287,6 +428,64 @@ export function renderCompetition(competition) {
     [shaped.timezoneText, shaped.sportsText, shaped.manualText].filter(Boolean).join(' · '),
   );
   if (d.windowStatus) d.windowStatus.dataset.state = shaped.state;
+  renderMonthPicker(competition);
+}
+
+/**
+ * Render the month picker from the server's own view of what is selectable.
+ *
+ * Rebuilt wholesale on every render rather than diffed: the option list only changes when
+ * the bounds do, and `replaceChildren` + one `value` assignment is far less code than a
+ * reconciliation nobody will read again. `option.textContent` (never innerHTML) for the same
+ * reason it is used everywhere else in this file.
+ *
+ * The `<select>`'s value is set from the RESPONSE, not from whatever the reader clicked.
+ * That is what makes a clamped month self-correcting: ask for 2030-01, get 2026-08 back, and
+ * the control snaps to what is actually on screen instead of lying about it.
+ *
+ * @param {object} competition
+ */
+export function renderMonthPicker(competition) {
+  const d = dom();
+  const shaped = shapeMonthPicker(competition);
+
+  setVisible(d.monthPicker, shaped.usable);
+
+  const select = d.monthSelect;
+  if (select) {
+    // Rebuild the option list ONLY when it actually differs.
+    //
+    // This runs on every render pass -- including each poll of a running sync -- and the list
+    // can be MAX_PICKER_MONTHS long, so the naive version recreated up to 120 elements a few
+    // times a second to produce byte-identical markup. Worse than the wasted work: replacing a
+    // <select>'s children is a destructive reset of a control the reader may be using, which
+    // is what made the dropdown feel like it was fighting back.
+    //
+    // The signature covers the month AND its "(this month)" marker, so a rollover from August
+    // to September relabels rather than silently keeping a stale marker.
+    const signature = shaped.options.map((item) => (item.current ? `${item.month}*` : item.month)).join(',');
+    if (signature !== monthOptionsSignature) {
+      const options = document.createDocumentFragment();
+      for (const item of shaped.options) {
+        const option = document.createElement('option');
+        option.value = item.month;
+        // "(this month)" rather than a style, because styles.css is not this module's to write
+        // and the distinction has to survive in text either way.
+        option.textContent = item.current ? `${item.label} (this month)` : item.label;
+        options.append(option);
+      }
+      select.replaceChildren(options);
+      monthOptionsSignature = signature;
+    }
+    // Always reasserted, even when the list was reused: the selected month is what the SERVER
+    // resolved to, and that changes on every month switch while the option list does not.
+    if (shaped.selected !== '') select.value = shaped.selected;
+  }
+
+  // `disabled` and not `hidden`: a button that vanishes at the ends of the range moves the
+  // two controls next to it sideways on every click.
+  if (d.monthPrev) d.monthPrev.disabled = !shaped.hasPrev;
+  if (d.monthNext) d.monthNext.disabled = !shaped.hasNext;
 }
 
 /**
@@ -482,6 +681,29 @@ export function setRefreshPending(pending, label) {
   setText(text, label ?? (pending ? 'Syncing…' : 'Refresh'));
 }
 
+/**
+ * Disable the month controls while that month's board is in flight.
+ *
+ * Without it a reader can queue three month changes in a second and the board lands on
+ * whichever response happens to arrive last, which is not necessarily the one they picked.
+ *
+ * @param {boolean} pending
+ */
+export function setMonthPickerPending(pending) {
+  const d = dom();
+  const busy = Boolean(pending);
+  if (d.monthSelect) {
+    d.monthSelect.disabled = busy;
+    d.monthSelect.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+  // Re-enabled by the next renderMonthPicker, which is the only thing that knows whether
+  // each end of the range is actually live.
+  if (busy) {
+    if (d.monthPrev) d.monthPrev.disabled = true;
+    if (d.monthNext) d.monthNext.disabled = true;
+  }
+}
+
 /** Announce transient progress in a polite live region. */
 export function setStatus(text) {
   setText(dom().status, text ?? '');
@@ -601,6 +823,18 @@ export function bindEvents(handlers) {
     d.refresh.addEventListener('click', () => handlers.onRefresh());
   }
   if (d.logout && handlers.onLogout) d.logout.addEventListener('click', () => handlers.onLogout());
+
+  // `change`, not `input`: on a <select> `input` fires for keyboard arrowing through the
+  // options too, so every month between the old and new one would trigger its own fetch.
+  if (d.monthSelect && handlers.onMonthChange) {
+    d.monthSelect.addEventListener('change', () => handlers.onMonthChange(d.monthSelect.value));
+  }
+  if (d.monthPrev && handlers.onMonthPrev) {
+    d.monthPrev.addEventListener('click', () => handlers.onMonthPrev());
+  }
+  if (d.monthNext && handlers.onMonthNext) {
+    d.monthNext.addEventListener('click', () => handlers.onMonthNext());
+  }
   if (d.dialogLogout && handlers.onLogout) {
     d.dialogLogout.addEventListener('click', () => handlers.onLogout());
   }

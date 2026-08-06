@@ -38,6 +38,21 @@ const NOW_SECONDS = Math.floor(NOW / 1000);
 
 const EXPECTED = ACTIVITY_FIXTURE.expected;
 
+/**
+ * Per-month slices, because a leaderboard read now covers ONE month.
+ *
+ * `EXPECTED.counted_miles` (224.0) is the sum over the fixture's three months, so no single
+ * `buildLeaderboard` call returns it any more. `NOW` sits in August, which is the month an
+ * un-parameterised read resolves to.
+ *
+ * AUG = 202 records / 202.0 mi, JUL = 6 / 20.0, JUN = 2 / 2.0. The two rides these tests
+ * mutate (15000000001, 1.0 mi) are dated 2026-07-05, i.e. JULY -- so an edit or a soft delete
+ * of them moves July's total and leaves August's untouched.
+ */
+const AUG = EXPECTED.by_month['2026-08'];
+const JUL = EXPECTED.by_month['2026-07'];
+const JUN = EXPECTED.by_month['2026-06'];
+
 setLogSink(() => {});
 
 async function setup({ fakeOpts = {}, seedTokens = true } = {}) {
@@ -106,14 +121,29 @@ test('a full sync stores EVERY record, counts only the countable ones, and total
   assert.equal(await countRows(ctx.db), EXPECTED.total_records);
   assert.equal(res.activitiesRemoved, 0);
 
-  // ...and the counted number agrees with what the board will show.
+  // ...and the counted number agrees with what the board will show. `activitiesCounted` is a
+  // property of the FETCH, so it stays the whole-fixture 210 across all three months.
   assert.equal(res.activitiesCounted, EXPECTED.counted_records);
 
+  // The board, by contrast, is one month. August is what NOW resolves to.
   const lb = await buildLeaderboard(ctx.db, ctx.config, { nowMs: NOW });
   assert.equal(lb.teams[0].team, 'EAST');
-  assert.equal(lb.teams[0].miles, EXPECTED.counted_miles);
-  assert.equal(lb.totals.miles, EXPECTED.counted_miles);
-  assert.equal(lb.teams[0].ride_count, EXPECTED.counted_records);
+  assert.equal(lb.teams[0].miles, AUG.miles);
+  assert.equal(lb.totals.miles, AUG.miles);
+  assert.equal(lb.teams[0].ride_count, AUG.records);
+
+  // Every month of the fixture, so the 224.0 mi this test is named for is still fully
+  // accounted for -- just spread across three separate competitions instead of pooled into
+  // one. Without this, dropping to a single month would have quietly halved the coverage.
+  const july = await buildLeaderboard(ctx.db, ctx.config, { month: '2026-07', nowMs: NOW });
+  const june = await buildLeaderboard(ctx.db, ctx.config, { month: '2026-06', nowMs: NOW });
+  assert.equal(july.totals.miles, JUL.miles);
+  assert.equal(june.totals.miles, JUN.miles);
+  assert.equal(
+    AUG.miles + JUL.miles + JUN.miles,
+    EXPECTED.counted_miles,
+    'the three months must still sum to the fixture total',
+  );
 
   const state = await getSyncState(ctx.db, ATHLETE_ID);
   assert.equal(state.last_status, 'ok');
@@ -203,8 +233,10 @@ test('two syncs leave COUNT(*) unchanged, and an edited distance updates in plac
   assert.equal(row.deleted_at, null);
 
   // 1.0 mi became 10.0 mi, so the board moved by exactly 9 miles. No double count anywhere.
-  const lb = await buildLeaderboard(ctx.db, ctx.config, { nowMs: NOW });
-  assert.equal(lb.totals.miles, EXPECTED.counted_miles + 9);
+  // Read JULY: the edited ride is dated 2026-07-05, so August's total never moves and this
+  // assertion would pass for the wrong reason against the default month.
+  const lb = await buildLeaderboard(ctx.db, ctx.config, { month: '2026-07', nowMs: NOW });
+  assert.equal(lb.totals.miles, JUL.miles + 9);
 });
 
 // ------------------------------------------------------- partial fetches
@@ -289,10 +321,12 @@ test('a full sync soft-deletes exactly the ride Strava no longer reports', async
   // The row is still there -- a soft delete, so an un-hidden ride can come back.
   assert.equal(await countRows(ctx.db), EXPECTED.total_records);
 
-  // It was a 1.0 mi ride, so the board drops by exactly one mile.
-  const lb = await buildLeaderboard(ctx.db, ctx.config, { nowMs: NOW });
-  assert.equal(lb.totals.miles, EXPECTED.counted_miles - 1);
-  assert.equal(lb.teams[0].ride_count, EXPECTED.counted_records - 1);
+  // It was a 1.0 mi ride, so the board drops by exactly one mile -- in JULY, where that ride
+  // lives (2026-07-05). Against August the soft delete is invisible and this would assert
+  // nothing at all.
+  const lb = await buildLeaderboard(ctx.db, ctx.config, { month: '2026-07', nowMs: NOW });
+  assert.equal(lb.totals.miles, JUL.miles - 1);
+  assert.equal(lb.teams[0].ride_count, JUL.records - 1);
 
   const after = await getSyncState(ctx.db, ATHLETE_ID);
   assert.equal(after.watermark_epoch, before.watermark_epoch);
@@ -512,7 +546,7 @@ test('a revoked grant surfaces as StravaGrantRevokedError and keeps every activi
   // vanishing mid-competition and taking their team's miles with them.
   assert.equal(await countRows(ctx.db), EXPECTED.total_records);
   const lb = await buildLeaderboard(ctx.db, ctx.config, { nowMs: NOW });
-  assert.equal(lb.totals.miles, EXPECTED.counted_miles);
+  assert.equal(lb.totals.miles, AUG.miles);
   assert.equal(lb.riders[0].revoked, true);
 });
 

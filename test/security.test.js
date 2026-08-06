@@ -233,6 +233,62 @@ test('safeReturnTo: legitimate same-origin paths are preserved', () => {
   assert.equal(safeReturnTo(config, 'http://localhost:4000/leaderboard'), '/');
 });
 
+test('safeReturnTo: WEB_BASE_PATH confines the result to the Pages project sub-path', () => {
+  // The default-domain deploy: public/ is served from user.github.io/<repo>/, so the origin
+  // root is GitHub's 404 page and the origin is shared with every other project on that
+  // account. An origin check alone would happily hand a freshly authenticated rider -- with
+  // #token= still in the URL on the bearer path -- to somebody else's project.
+  const config = testConfig({
+    APP_BASE_URL: 'https://julienmcollins.github.io',
+    API_BASE_URL: 'https://eastvswest.julienmcollins.workers.dev',
+    WEB_ORIGIN: 'https://julienmcollins.github.io',
+    WEB_BASE_PATH: '/eastvswest',
+  });
+  const HOME = '/eastvswest/';
+
+  assert.equal(config.webBasePath, '/eastvswest');
+  assert.equal(config.webAppUrl, 'https://julienmcollins.github.io/eastvswest');
+
+  // The app root, however it is spelled.
+  assert.equal(safeReturnTo(config, ''), HOME);
+  assert.equal(safeReturnTo(config, '/eastvswest'), '/eastvswest', 'the root without its slash is legitimate');
+  assert.equal(safeReturnTo(config, HOME), HOME);
+
+  // Paths inside the app survive intact.
+  assert.equal(safeReturnTo(config, '/eastvswest/rules?team=EAST'), '/eastvswest/rules?team=EAST');
+  assert.equal(
+    safeReturnTo(config, 'https://julienmcollins.github.io/eastvswest/rules'),
+    '/eastvswest/rules',
+  );
+
+  // A RELATIVE value resolves against the app root, not the origin root -- otherwise
+  // `?month=2026-09` would silently land on GitHub's 404 page.
+  assert.equal(safeReturnTo(config, '?month=2026-09'), '/eastvswest/?month=2026-09');
+  assert.equal(safeReturnTo(config, 'rules'), '/eastvswest/rules');
+
+  // Same origin, DIFFERENT project: rejected. This is the case a bare origin check misses.
+  for (const value of [
+    '/',
+    '/some-other-project/',
+    '/some-other-project/steal.html',
+    'https://julienmcollins.github.io/other/',
+    // `/eastvswestX` shares the base path as a string PREFIX but is a different project, so
+    // the check must compare against `/eastvswest/`, not `/eastvswest`.
+    '/eastvswest-old/',
+    '/eastvswestevil',
+    // Escapes back out of the sub-path after normalization.
+    '/eastvswest/../other/',
+  ]) {
+    assert.equal(safeReturnTo(config, value), HOME, `expected ${HOME} for ${JSON.stringify(value)}`);
+  }
+
+  // Every payload that normalized to '/' at a domain root must now normalize to the app root,
+  // never to '/'.
+  for (const value of ['//evil.com', 'https://evil.com', '/\\evil.com', '/%09/evil.com', '/%zz', null]) {
+    assert.equal(safeReturnTo(config, value), HOME, `expected ${HOME} for ${JSON.stringify(value)}`);
+  }
+});
+
 /* ============================== sessions ============================== */
 
 async function sessionFixture(overrides = {}) {
@@ -388,6 +444,36 @@ test('csrf: each leg fails closed with 403', () => {
   // Content types an HTML form can actually produce.
   for (const ct of ['text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data', undefined]) {
     assert.throws(() => requireCsrf(fakeReq({ ...base, 'content-type': ct }), config, { cookies }), is403);
+  }
+});
+
+test('csrf: a bearer caller skips the double-submit but not the other two legs', () => {
+  // On the cross-site deploy `bc_csrf` is a third-party cookie the browser never returns, so
+  // public/api.js has no token to echo. Without the exemption every POST -- team pick, sync,
+  // logout -- 403s with `token_absent` on a deploy that otherwise looks healthy.
+  const config = testConfig();
+  const is403 = (err) => err.status === 403 && err.code === 'csrf_failed';
+  const bearer = { credentialSource: 'bearer' };
+  const base = { 'content-type': 'application/json', origin: 'http://localhost:3000' };
+
+  // No CSRF cookie and no header, which is exactly what the browser produces cross-site.
+  assert.doesNotThrow(() => requireCsrf(fakeReq(base), config, bearer));
+  assert.doesNotThrow(() => requireCsrf(fakeReq(base), config, { ...bearer, cookies: new Map() }));
+
+  // The exemption is scoped to leg 3 ONLY. Origin and content-type still decide, because they
+  // are what a cross-origin attacker cannot satisfy.
+  assert.throws(() => requireCsrf(fakeReq({ ...base, origin: 'https://evil.com' }), config, bearer), is403);
+  assert.throws(() => requireCsrf(fakeReq({ ...base, origin: undefined }), config, bearer), is403);
+  assert.throws(() => requireCsrf(fakeReq({ ...base, 'content-type': 'text/plain' }), config, bearer), is403);
+
+  // And it applies to NOTHING else. A cookie session, or no credential at all, still needs the
+  // double submit -- otherwise the exemption would be a blanket opt-out.
+  for (const source of ['cookie', null, undefined]) {
+    assert.throws(
+      () => requireCsrf(fakeReq(base), config, { credentialSource: source, cookies: new Map() }),
+      is403,
+      `credentialSource ${JSON.stringify(source)} must still require the token`,
+    );
   }
 });
 

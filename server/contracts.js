@@ -20,8 +20,17 @@ export const METERS_PER_MILE = 1609.344;
 /**
  * Bumped whenever the /api shape changes in a way the frontend must notice. The client
  * compares it and shows a "reload to update" banner on mismatch.
+ *
+ * MUST be bumped in the SAME CHANGE as `API_SCHEMA` in public/config.js -- they are two
+ * halves of one constant, and a bump on only one side is indistinguishable from a stale
+ * cached module: every visitor gets the banner and nothing renders.
+ *
+ * 2: the month picker. `competition` describes ONE SELECTED MONTH (`month`, `first_month`,
+ *    `last_month`, `prev_month`, `next_month`, `current_month`) instead of one configured
+ *    season, and `state`/`days_remaining` are per-month. /api/leaderboard, /api/me and
+ *    /api/riders/:id/activities take `?month=YYYY-MM`.
  */
-export const API_SCHEMA = 1;
+export const API_SCHEMA = 2;
 
 /**
  * Either of these Strava scopes lets us read the rides we need. `activity:read_all`
@@ -109,7 +118,32 @@ export const STRAVA_PAGE_SIZE = 200;
 /** Refuse to page forever if something goes wrong with termination detection. */
 export const STRAVA_MAX_PAGES = 40;
 
-/** Competition state values in /api/me and /api/leaderboard. */
+/**
+ * Hard ceiling on how many months `[first_month, last_month]` may span.
+ *
+ * The range is a UNION of the configured window, the current month, and every month that has
+ * ride data (see `monthBounds` in server/lib/dates.js), so a single fat-fingered
+ * `COMPETITION_START=1026-06-01` -- or one activity row with a corrupt `start_date_local` --
+ * would otherwise ask the browser to build twelve thousand `<option>` elements on first paint.
+ *
+ * The cap consumes the OLDEST months first, because the current month must stay reachable: it
+ * is the only one with a live `open` state, and a picker that cannot offer "now" is the bug
+ * this whole range rule exists to fix.
+ *
+ * MIRRORED by `MAX_PICKER_MONTHS` in public/config.js, which caps the option list it builds.
+ * The client's copy is defence in depth against a server that ignores this one; keep the two
+ * numbers equal or the `<select>` silently offers fewer months than `prev_month` will step to.
+ */
+export const MAX_PICKER_MONTHS = 120;
+
+/**
+ * `competition.state` values in /api/me and /api/leaderboard.
+ *
+ * These describe the SELECTED MONTH, not a season: `closed` is a month that has already
+ * ended, `open` is the current month, `upcoming` is a month that has not begun. The wire
+ * literals are unchanged from the single-season model on purpose -- the client already
+ * switches on them, and renaming them would have been a second breaking change for nothing.
+ */
 export const COMPETITION_STATES = Object.freeze({
   UPCOMING: 'upcoming',
   OPEN: 'open',

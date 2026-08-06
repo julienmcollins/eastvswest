@@ -4,6 +4,11 @@
     "start": "2026-06-01",
     "end": "2026-08-31"
   },
+  "months": [
+    "2026-06",
+    "2026-07",
+    "2026-08"
+  ],
   "allowed_sport_types": [
     "Ride",
     "GravelRide",
@@ -3713,6 +3718,23 @@
     "counted_records": 210,
     "counted_meters": 360493.05599999975,
     "counted_miles": 224,
+    "by_month": {
+      "2026-07": {
+        "records": 6,
+        "meters": 32186.880000000005,
+        "miles": 20
+      },
+      "2026-06": {
+        "records": 2,
+        "meters": 3218.688,
+        "miles": 2
+      },
+      "2026-08": {
+        "records": 202,
+        "meters": 325087.4880000001,
+        "miles": 202
+      }
+    },
     "excluded_ids": [
       15000000005,
       15000000006,

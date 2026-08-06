@@ -12,7 +12,7 @@
  * not take the page down at parse time).
  */
 
-import { API_BASE, CSRF_COOKIE, TOKEN_STORAGE_KEY } from './config.js?v=1';
+import { API_BASE, CSRF_COOKIE, TOKEN_STORAGE_KEY } from './config.js?v=2';
 
 /**
  * Every non-2xx response and every network failure surfaces as this. Callers switch on
@@ -195,14 +195,31 @@ async function parseBody(response) {
   }
 }
 
+/**
+ * `?month=YYYY-MM`, or `''` when no month is selected yet.
+ *
+ * `''` is not a fallback we settle for -- it is how the FIRST load works: the server owns
+ * "which month is current in COMPETITION_TZ", so the boot request deliberately sends no
+ * month and takes the default the response reports back. A client that guessed the month
+ * from its own clock would show a different board than the picker on a laptop set to
+ * yesterday, or one timezone east of the configured one.
+ *
+ * @param {unknown} month
+ * @returns {string}
+ */
+function monthQuery(month) {
+  if (typeof month !== 'string' || !/^\d{4}-\d{2}$/.test(month)) return '';
+  return `?month=${encodeURIComponent(month)}`;
+}
+
 /** GET /api/me — 200 with `rider: null` when logged out, never 401. */
-export function getMe(signal) {
-  return request('/api/me', { signal });
+export function getMe(signal, month) {
+  return request(`/api/me${monthQuery(month)}`, { signal });
 }
 
 /** GET /api/leaderboard — 200 always; the empty state is zeroed teams and `riders: []`. */
-export function getLeaderboard(signal) {
-  return request('/api/leaderboard', { signal });
+export function getLeaderboard(signal, month) {
+  return request(`/api/leaderboard${monthQuery(month)}`, { signal });
 }
 
 /** POST /api/me/team — one-time claim. 409 `team_already_set` if it is already locked. */
@@ -213,10 +230,18 @@ export function setTeam(team) {
 /**
  * POST /api/me/sync — the response embeds an entire /api/leaderboard payload, so Refresh
  * is one round trip.
+ *
+ * `month` is the month ON SCREEN, sent so the embedded board comes back for it. Omitting it
+ * would make Refresh silently snap the view from June to the current month.
+ *
  * @param {'incremental'|'full'} [mode] omit to let the server choose
+ * @param {string} [month] `YYYY-MM`; omit for the server's default month
  */
-export function syncNow(mode) {
-  return request('/api/me/sync', { method: 'POST', body: mode ? { mode } : {} });
+export function syncNow(mode, month) {
+  const body = {};
+  if (mode) body.mode = mode;
+  if (typeof month === 'string' && /^\d{4}-\d{2}$/.test(month)) body.month = month;
+  return request('/api/me/sync', { method: 'POST', body });
 }
 
 /** POST /api/me/disconnect — deauthorises at Strava, keeps the team and history. */

@@ -225,6 +225,140 @@ test('return_to is honoured, and an off-origin return_to collapses to /', async 
   assert.equal(backslash.callback.headers.location, `${config.webOrigin}/`);
 });
 
+/* ---------------------------------------------- the default-domain (cross-site) deploy ---- */
+
+/**
+ * `user.github.io` + `<worker>.<account>.workers.dev`: two registrable domains, so `bc_sid`
+ * and `bc_csrf` are both third-party cookies. AUTH_TOKEN_IN_FRAGMENT hands the session token
+ * to the frontend in the URL fragment instead, and WEB_BASE_PATH aims the redirect at the
+ * Pages PROJECT sub-path rather than the origin root, which is GitHub's own 404 page.
+ *
+ * The TTL is inside config.js's 24 h ceiling for this mode on purpose: the default 30 days
+ * would refuse to boot, which is the point of that check.
+ */
+const CROSS_SITE = Object.freeze({
+  APP_BASE_URL: 'https://julienmcollins.github.io',
+  WEB_ORIGIN: 'https://julienmcollins.github.io',
+  API_BASE_URL: 'https://eastvswest.julienmcollins.workers.dev',
+  WEB_BASE_PATH: '/eastvswest',
+  AUTH_TOKEN_IN_FRAGMENT: 'true',
+  SESSION_TTL_SECONDS: '43200',
+});
+
+test('cross-site deploy: the callback lands on the project sub-path with #token=', async () => {
+  const { app, fake, config, db } = await harness({ configOverrides: CROSS_SITE });
+
+  const { callback } = await connect(app, fake);
+  assert.equal(callback.status, 302);
+
+  const location = new URL(callback.headers.location);
+  assert.equal(location.origin, 'https://julienmcollins.github.io');
+  assert.equal(location.pathname, '/eastvswest/', 'the origin root is GitHub 404, not the app');
+
+  // A FRAGMENT, never a query parameter: this is a live session credential and fragments are
+  // never sent to a server, a proxy, or a CDN log.
+  const token = new URLSearchParams(location.hash.slice(1)).get('token');
+  assert.ok(token, 'no #token= in the callback redirect');
+  assert.equal(location.search, '', 'the token must never appear in the query string');
+
+  // The token IS the session credential -- the same value the cookie carries, so one code
+  // path serves both deploys.
+  assert.equal(token, callback.cookies.bc_sid);
+  const me = await call(app, {
+    method: 'GET',
+    url: '/api/me',
+    headers: { origin: 'https://julienmcollins.github.io', authorization: `Bearer ${token}` },
+  });
+  assert.equal(me.json.authenticated, true);
+  assert.equal((await listSessionsForAthlete(db, me.json.rider.athlete_id)).length, 1);
+  assert.equal(config.authTokenInFragment, true);
+});
+
+test('cross-site deploy: a bearer POST succeeds with NO CSRF cookie at all', async () => {
+  // The regression this guards: cross-site the browser never returns bc_csrf, so public/api.js
+  // sends no X-CSRF-Token and every mutating route would 403 with `token_absent` on a deploy
+  // that otherwise looks completely healthy -- OAuth works, /api/me works, nothing 4xxs until
+  // the rider picks a team.
+  const { app, fake } = await harness({ configOverrides: CROSS_SITE });
+
+  const { callback } = await connect(app, fake);
+  const token = new URLSearchParams(new URL(callback.headers.location).hash.slice(1)).get('token');
+
+  const pick = await call(app, {
+    method: 'POST',
+    url: '/api/me/team',
+    headers: {
+      origin: 'https://julienmcollins.github.io',
+      'content-type': 'application/json',
+      authorization: `Bearer ${token}`,
+    },
+    body: { team: 'WEST' },
+  });
+  assert.equal(pick.status, 200, `expected 200, got ${pick.status}: ${pick.body}`);
+  assert.equal(pick.json.team, 'WEST');
+  assert.equal(pick.json.rider.team, 'WEST');
+
+  // Same request WITHOUT the bearer header is still refused. The exemption is tied to the
+  // credential, not to the deployment mode.
+  const forged = await call(app, {
+    method: 'POST',
+    url: '/api/me/team',
+    headers: { origin: 'https://julienmcollins.github.io', 'content-type': 'application/json' },
+    cookies: { bc_sid: token },
+    body: { team: 'EAST' },
+  });
+  assert.equal(forged.status, 403);
+  assert.equal(forged.json.error, 'csrf_failed');
+});
+
+test('cross-site deploy: a bearer header cannot be used to spend a cookie session', async () => {
+  // The obvious attack on the CSRF exemption: attach any Authorization header to skip leg 3
+  // and let the victim's ambient cookies do the authenticating. credentialFrom PREFERS the
+  // bearer value, so the request resolves to no session rather than falling back.
+  const { app, fake } = await harness({ configOverrides: CROSS_SITE });
+
+  const { callback } = await connect(app, fake);
+  const real = new URLSearchParams(new URL(callback.headers.location).hash.slice(1)).get('token');
+
+  const res = await call(app, {
+    method: 'POST',
+    url: '/api/me/team',
+    headers: {
+      origin: 'https://julienmcollins.github.io',
+      'content-type': 'application/json',
+      authorization: 'Bearer not-a-real-session-token',
+    },
+    // The victim's real credential, riding along exactly as a browser would send it.
+    cookies: { bc_sid: real },
+    body: { team: 'EAST' },
+  });
+  assert.equal(res.status, 401, `expected 401, got ${res.status}: ${res.body}`);
+  assert.equal(res.json.error, 'unauthenticated');
+});
+
+test('cross-site deploy: callback FAILURES also land on the project sub-path', async () => {
+  const { app, fake } = await harness({ configOverrides: CROSS_SITE });
+
+  const { callback } = await connect(app, fake, { deny: true });
+  assert.equal(
+    callback.headers.location,
+    'https://julienmcollins.github.io/eastvswest/#error=denied',
+    'an error fragment dropped at the origin root is an error the rider never sees',
+  );
+});
+
+test('AUTH_TOKEN_IN_FRAGMENT off means no token in the URL, even cross-site', async () => {
+  // The flag is the whole switch. Nothing about a cross-origin WEB_ORIGIN should start
+  // exporting session tokens into URLs on its own.
+  const { app, fake } = await harness({
+    configOverrides: { ...CROSS_SITE, AUTH_TOKEN_IN_FRAGMENT: 'false' },
+  });
+
+  const { callback } = await connect(app, fake);
+  assert.equal(callback.headers.location, 'https://julienmcollins.github.io/eastvswest/');
+  assert.equal(callback.headers.location.includes('#'), false);
+});
+
 // ---------------------------------------------------------------- callback, rejections
 
 test('replaying the same state is rejected with #error=state_expired', async () => {
