@@ -28,7 +28,7 @@
                          host to public/config.js, or the site silently stops talking to
                          its own API with no CORS error and no 4xx to debug.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self' https://eastvswest.julienmcollins.workers.dev; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 
 <!-- Every path in this file is RELATIVE. At deploy time the Pages artifact root IS

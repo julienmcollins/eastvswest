@@ -104,7 +104,7 @@ const API_BASE_BY_HOSTNAME = Object.freeze({
   '': SAME_ORIGIN, // a file:// URL has an empty hostname
 
   // ---- PRODUCTION: uncomment and set both, then widen the CSP to match. ----
-  // 'www.example.com': 'https://api.example.com',
+  'julienmcollins.github.io': 'https://eastvswest.julienmcollins.workers.dev',
 });
 
 /**

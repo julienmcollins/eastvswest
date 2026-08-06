@@ -300,17 +300,28 @@ function handleWithNodeApi(app, request, ctx) {
 /**
  * `Headers` -> a lowercase plain object, the shape `req.headers` has in Node.
  *
- * `cookie` is the one header that can legitimately arrive more than once; `Headers.get`
- * already joins repeats with ', ', which is wrong for cookies (they join with '; '), so it is
- * rebuilt from getAll where available.
+ * `cookie` is the one header that can legitimately arrive more than once, and a runtime that
+ * joins those repeats with ', ' produces a header parseCookies would read as one mangled name,
+ * making every session look absent. It has to be undone on the joined string: `getAll` is not
+ * an option, because both workerd and undici restrict it to 'Set-Cookie' -- workerd throws
+ * `TypeError: getAll() can only be used with the header name "Set-Cookie"` for any other name,
+ * and undici does not define the method at all.
  */
 function headersToObject(headers) {
   const out = Object.create(null);
   for (const [name, value] of headers) out[name.toLowerCase()] = value;
-  const cookies = typeof headers.getAll === 'function' ? headers.getAll('cookie') : null;
-  if (cookies && cookies.length > 1) out.cookie = cookies.join('; ');
+  if (out.cookie) out.cookie = out.cookie.replace(COOKIE_HEADER_JOIN, '; ');
   return out;
 }
+
+/**
+ * A ', ' that joined two Cookie headers, as opposed to a comma inside a cookie value.
+ *
+ * RFC 6265 cookie-octet excludes both comma and semicolon, so an unquoted comma in a Cookie
+ * header is always a join; requiring a `name=` after it keeps a quoted value that does contain
+ * one intact. Undici already joins cookies with '; ', which this leaves untouched.
+ */
+const COOKIE_HEADER_JOIN = /,\s*(?=[^\s=;,]+=)/g;
 
 /** Exported for the test suite, which drives the adapter without a Workers runtime. */
 export { handleWithNodeApi };

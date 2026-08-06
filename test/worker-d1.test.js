@@ -431,17 +431,39 @@ test('adapter: CORS preflight and a credentialed cross-origin GET both work end 
 });
 
 test('adapter: a repeated Cookie header joins with "; " rather than ", "', async () => {
-  // Headers.get joins repeats with ', ', which is correct for most headers and wrong for
-  // Cookie -- parseCookies would then read one mangled name and every session would look
-  // absent. Skipped where getAll is unavailable; Workers provides it.
-  const headers = new Headers();
-  if (typeof headers.getAll !== 'function') return;
+  // A runtime that joins Cookie repeats with ', ' (workerd does; undici already uses '; ')
+  // would leave parseCookies reading one mangled name, so every session would look absent.
+  // getAll cannot be used to rebuild it: workerd throws a TypeError for any name other than
+  // Set-Cookie, and undici has no such method -- hence the string-level fix under test.
   const call = adapter(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ cookie: req.headers.cookie }));
   });
+
+  const headers = new Headers();
   headers.append('cookie', 'bc_sid=a');
   headers.append('cookie', 'bc_csrf=b');
   const res = await call('https://api.test/', { headers });
   assert.equal((await res.json()).cookie, 'bc_sid=a; bc_csrf=b');
+
+  // The workerd shape, stated literally: whatever the host runtime hands over, the header that
+  // reaches parseCookies is '; '-delimited.
+  const joined = await call('https://api.test/', { headers: { cookie: 'bc_sid=a, bc_csrf=b' } });
+  assert.equal((await joined.json()).cookie, 'bc_sid=a; bc_csrf=b');
+
+  // A comma inside a (quoted) cookie value is not a join and stays put.
+  const quoted = await call('https://api.test/', { headers: { cookie: 'bc_sid="a,b"' } });
+  assert.equal((await quoted.json()).cookie, 'bc_sid="a,b"');
+});
+
+test('adapter: every request survives header conversion, cookie or not', async () => {
+  // The regression this guards: headersToObject threw a TypeError for EVERY request, so even
+  // GET /api/health -- no cookie, no auth -- came back as a worker error rather than a 200.
+  const call = adapter(async (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ cookie: req.headers.cookie ?? null, accept: req.headers.accept }));
+  });
+  const res = await call('https://api.test/api/health', { headers: { Accept: 'application/json' } });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { cookie: null, accept: 'application/json' });
 });
