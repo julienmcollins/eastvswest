@@ -18,8 +18,11 @@ import { maxStartEpoch, nextQuarterHourMs, nextUtcMidnightMs, parseRateLimitHead
  *     implementation logs the failed request on a token-endpoint 400 -- which writes
  *     STRAVA_CLIENT_SECRET and a live refresh token to stdout on precisely the code path
  *     whose output is most likely to be pasted into a bug report. Log lines carry only
- *     {method, host, pathname, status, attempt, rateLimitUsage}, composed by #logRequest
- *     from named arguments so no call site can widen them.
+ *     {method, host, pathname, status, attempt, rateLimitUsage}, plus {errorName,
+ *     errorMessage} on the transport-failure line alone, composed by #logRequest from named
+ *     arguments so no call site can widen them. Those two are the STRINGS off a transport
+ *     failure, never the error object: undici hangs the original Request (and therefore the
+ *     form body) off some of its network errors. See the catch in #request.
  *
  *  3. The HTTP handler is never slept for a rate limit. A 429 records a block until the
  *     next bucket boundary and throws; the user sees "rate limited, try again at 14:45
@@ -179,7 +182,22 @@ class StravaClient {
     clientId,
     clientSecret,
     redirectUri,
-    fetchImpl = globalThis.fetch,
+    /**
+     * BOUND to the global, not merely referenced.
+     *
+     * The call site is `this.#fetch(url, init)`, so the receiver is the StravaClient
+     * instance. workerd's `fetch` is a method of the global scope and validates its `this`:
+     * with any other receiver it throws `TypeError: Illegal invocation` synchronously,
+     * before a packet leaves the isolate. undici ignores the receiver entirely, so on Node
+     * every test in this suite passes and only a real Worker fails -- which is exactly how
+     * this presented: `strava.transport_error status=null attempt=1` on POST /oauth/token,
+     * 42 ms into the request, so every sign-in died at `exchange_failed:strava_unavailable`
+     * while D1-only routes stayed green.
+     *
+     * `?.` so a runtime with no global fetch still reaches the clearer TypeError below
+     * rather than dying on the bind.
+     */
+    fetchImpl = globalThis.fetch?.bind(globalThis),
     now = () => Date.now(),
     logger = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -522,12 +540,12 @@ class StravaClient {
    * Takes named scalars, never an object to spread, so there is no syntactic way for a
    * caller to slip `form`, `headers`, or a token into a log line.
    */
-  #logRequest(level, event, { method, host, pathname, status = null, attempt = 1 }) {
+  #logRequest(level, event, { method, host, pathname, status = null, attempt = 1, errorName = null, errorMessage = null }) {
     const logger = this.#logger;
     if (!logger) return;
     const fn = typeof logger[level] === 'function' ? logger[level] : logger.info;
     if (typeof fn !== 'function') return;
-    fn.call(logger, {
+    const line = {
       event,
       method,
       host,
@@ -535,7 +553,13 @@ class StravaClient {
       status,
       attempt,
       rateLimitUsage: `${this.#usage.short}/${this.#limits.short},${this.#usage.daily}/${this.#limits.daily}`,
-    });
+    };
+    // Added only where they mean something -- the transport catch -- rather than as two nulls
+    // on every line. That keeps the key set of an ordinary line exactly as narrow as it was,
+    // which is what the rule-2 allowlist test asserts.
+    if (errorName !== null) line.errorName = errorName;
+    if (errorMessage !== null) line.errorMessage = errorMessage;
+    fn.call(logger, line);
   }
 
   /** Absorb whatever rate-limit headers a response happened to carry. */
@@ -720,13 +744,30 @@ class StravaClient {
           signal: AbortSignal.timeout(this.#timeoutMs),
         });
       } catch (cause) {
-        // `cause` is attached but never logged: DNS/TLS errors are safe, yet undici
-        // wraps the original request in some of them and we do not audit that.
+        // The `cause` OBJECT is attached to the error but never logged: undici hangs the
+        // original Request off some of its network errors, and that Request carries the form
+        // body -- STRAVA_CLIENT_SECRET and a live refresh token -- so handing the object to a
+        // logger would defeat rule 2 above.
+        //
+        // Its `name` and `message` are two strings and are logged, because without them this
+        // line said only "something threw": `status=null` covers DNS failure, TLS failure, an
+        // abort, and a runtime rejecting the call outright, which are four different fixes. A
+        // workerd `TypeError: Illegal invocation` (see the `fetchImpl` default) was
+        // indistinguishable from Strava being down for as long as this was silent. Safe to
+        // log because neither string is built from the body or the headers, and no secret is
+        // ever in the URL: credentials go in `form`, never in the query string.
         lastError = new StravaNetworkError(`Strava request failed in transport for ${logPath}.`, {
           path: logPath,
           cause,
         });
-        this.#logRequest('warn', 'strava.transport_error', { method, host, pathname: logPath, attempt });
+        this.#logRequest('warn', 'strava.transport_error', {
+          method,
+          host,
+          pathname: logPath,
+          attempt,
+          errorName: typeof cause?.name === 'string' ? cause.name : null,
+          errorMessage: typeof cause?.message === 'string' ? cause.message : null,
+        });
         if (attempt <= retriesAllowed) {
           await this.#sleep(this.#backoffMs(attempt));
           continue;

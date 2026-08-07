@@ -338,6 +338,18 @@ Then in a browser at the frontend URL (`https://www.example.com`, or
   implements `createCipheriv('aes-256-gcm')` and `timingSafeEqual` the way `security/crypto.js`
   needs. The first `wrangler deploy` is the real test; `curl /api/health` then a full sign-in is
   the sequence that exercises it.
+
+  The first deploy found exactly one bug of this class, and it is worth knowing the shape of it
+  because the next one will look the same. `server/strava/client.js` defaulted `fetchImpl` to
+  `globalThis.fetch` **unbound**, then called it as `this.#fetch(...)`. undici ignores the
+  receiver; workerd's `fetch` validates it and throws `TypeError: Illegal invocation`
+  synchronously. So D1-only routes (`/api/health`, `/api/leaderboard`, `/api/me`) were all 200
+  while every sign-in died 42 ms in with `strava.transport_error status=null` and
+  `oauth callback rejected reason=exchange_failed:strava_unavailable` — a failure that reads
+  exactly like Strava being down. The default is now bound, and the transport log line carries
+  `errorName`/`errorMessage` so the next one names itself in `wrangler tail` instead of
+  presenting as an outage. `test/strava-client.test.js` reproduces workerd's receiver check on
+  Node with a receiver-sensitive `globalThis.fetch`.
 - **No `CNAME` is committed**, deliberately — see step 2.
 - **Brand assets are still placeholders.** See the top of this file; this one is contractual.
 - **Shape B shares `localStorage` with every other project on `<user>.github.io`.** Bounded by

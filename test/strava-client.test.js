@@ -284,6 +284,87 @@ test('POST /oauth/token is NEVER retried, however transient the failure looks', 
   assert.equal(calls, 1);
 });
 
+/**
+ * THE WORKERD RECEIVER BUG. This is the test that was missing when every sign-in on the
+ * deployed Worker died at `exchange_failed:strava_unavailable`.
+ *
+ * The default `fetchImpl` is `globalThis.fetch`, and the call site is `this.#fetch(url, init)`
+ * -- so the receiver is the StravaClient instance. undici does not care, which is why all 411
+ * tests passed on Node. workerd's `fetch` is a method of the global scope and validates its
+ * `this`, throwing `TypeError: Illegal invocation` synchronously: no packet leaves the isolate,
+ * `status` is null, and POST /oauth/token gets no retry by design, so the whole OAuth callback
+ * failed 42 ms in while every D1-only route stayed green.
+ *
+ * The fake below is receiver-sensitive in exactly the way workerd is, so it reproduces that
+ * failure here. It has to install itself on `globalThis` because the DEFAULT argument is what
+ * is under test -- an injected `fetchImpl` never had this problem.
+ */
+test('the default fetchImpl is BOUND to the global, as workerd requires', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  try {
+    // eslint-disable-next-line func-names -- needs a dynamic `this`, so not an arrow.
+    globalThis.fetch = function (url, init) {
+      if (this !== globalThis) {
+        // Precisely workerd's behaviour, and the message it uses.
+        throw new TypeError('Illegal invocation: function called with incorrect `this` reference.');
+      }
+      seen.push({ url: String(url), method: init?.method });
+      return Promise.resolve(new Response(
+        JSON.stringify({
+          access_token: 'a',
+          refresh_token: 'r',
+          expires_at: 4000000000,
+          athlete: { id: 7 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ));
+    };
+
+    // No fetchImpl: the default is the whole point.
+    const client = createStravaClient({
+      apiBase: API_BASE,
+      oauthBase: OAUTH_BASE,
+      clientId: '12345',
+      clientSecret: SENTINEL,
+      redirectUri: REDIRECT_URI,
+      minRequestSpacingMs: 0,
+    });
+
+    const tokens = await client.exchangeCode('a-code');
+    assert.equal(tokens.accessToken, 'a');
+    assert.deepEqual(seen, [{ url: `${OAUTH_BASE}/token`, method: 'POST' }]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('a transport failure logs the cause name and message, and still no secret', async () => {
+  const fetchImpl = () => Promise.reject(
+    new TypeError('Illegal invocation: function called with incorrect `this` reference.'),
+  );
+  const { client, logCalls } = makeClient({ fetchImpl }, { fetchImpl });
+
+  await assert.rejects(() => client.exchangeCode('a-code'), StravaNetworkError);
+
+  const line = logCalls.find((c) => c.event === 'strava.transport_error');
+  assert.ok(line, 'the transport failure is logged');
+  assert.equal(line.status, null);
+  assert.equal(line.attempt, 1);
+  // Without these two the line said only "something threw", and a runtime rejecting the call
+  // outright was indistinguishable from Strava being down.
+  assert.equal(line.errorName, 'TypeError');
+  assert.match(line.errorMessage, /Illegal invocation/);
+  // Rule 2 still holds: the strings come off the error, never off the body or the headers, and
+  // the line is still an allowlist -- two keys wider than an ordinary one, and no wider.
+  assert.deepEqual(
+    Object.keys(line).sort(),
+    ['attempt', 'errorMessage', 'errorName', 'event', 'host', 'method', 'pathname', 'rateLimitUsage', 'status'],
+  );
+  assert.ok(!JSON.stringify(logCalls).includes(SENTINEL), 'the client secret never reaches a log line');
+  assert.ok(!JSON.stringify(logCalls).includes('a-code'), 'the authorization code never reaches a log line');
+});
+
 // ------------------------------------------------------------- rate limiting
 
 test('a 429 blocks until the next quarter hour and the NEXT call throws without sending', async () => {
