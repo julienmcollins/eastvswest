@@ -3,7 +3,7 @@ import { HttpError } from '../http/respond.js';
 import { log } from '../lib/log.js';
 import { isoUtcNow, startOfMonth, endOfMonth } from '../lib/dates.js';
 import { getAthlete as getAthleteRow, upsertAthleteFromStrava } from '../db/athletes.js';
-import { reconcileDeletions, upsertActivities } from '../db/activities.js';
+import { activityMonthExtent, reconcileDeletions, upsertActivities } from '../db/activities.js';
 import {
   acquireLock,
   advanceWatermark,
@@ -292,11 +292,24 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
   // is_admin, granted_scope and the revoked flags alone.
   await upsertAthleteFromStrava(db, athleteRaw, { nowIso: syncedAt });
 
+  // The fetch floor is widened by the extent of what we ALREADY hold, not just by config and the
+  // clock -- see computeSyncWindow. This is the query that makes the fetch range a superset of the
+  // month picker's range: `activityMonthExtent` is the same function `selectableMonthBounds` feeds
+  // to `monthBounds`, so a month a reader can select is a month this sync rescans. Reading it here
+  // rather than in map.js is the usual split: map.js has no database, and sync.js is the one module
+  // that may see both.
   const window = computeSyncWindow(config, {
     mode,
     watermarkEpoch: Number(state?.watermark_epoch ?? 0),
     nowMs,
+    dataMonths: await activityMonthExtent(db, config),
   });
+
+  // Logged, never silent: a window clipped by SYNC_MAX_MONTHS still reports `ok` and still
+  // reconciles, so without this line a rider whose history exceeds the cap looks fully synced.
+  if (window.trimmedFrom) {
+    log.warn('sync window trimmed to SYNC_MAX_MONTHS', { athlete_id: athleteId, mode, ...window.trimmedFrom });
+  }
 
   // ---- fetch. A failure mid-pagination is NOT fatal: the pages already in hand are worth
   // persisting (the upsert is idempotent), and the error's non-enumerable `partial` is how

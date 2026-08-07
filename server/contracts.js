@@ -137,6 +137,25 @@ export const STRAVA_MAX_PAGES = 40;
 export const MAX_PICKER_MONTHS = 120;
 
 /**
+ * Hard ceiling on how many months ONE SYNC may fetch, counting back from the current month.
+ *
+ * Not the same number as `MAX_PICKER_MONTHS`, and deliberately much smaller. The picker's cap
+ * bounds how many `<option>` elements a browser builds, which is cheap; this one bounds the only
+ * decision in the app that spends Strava rate limit, which is not. `computeSyncWindow` now widens
+ * its floor using the extent of STORED ride data, and that extent is derived from `local_date`
+ * values -- so a single row with a corrupt `start_date_local` (a year of `1026`) would otherwise
+ * make every sync, for every rider, forever, ask Strava for a millennium of pages.
+ *
+ * The OLDEST months are dropped first, for the same reason `monthBounds` trims that way: the
+ * current month is the only one that can still be ridden, so it must never be the one trimmed out.
+ *
+ * 24 months at a prolific ~40 rides/month is ~5 pages at `per_page=200` -- comfortably inside
+ * `STRAVA_MAX_PAGES`, which is what keeps a widened window from coming back `truncated` and
+ * therefore suppressing reconciliation on every run.
+ */
+export const SYNC_MAX_MONTHS = 24;
+
+/**
  * `competition.state` values in /api/me and /api/leaderboard.
  *
  * These describe the SELECTED MONTH, not a season: `closed` is a month that has already

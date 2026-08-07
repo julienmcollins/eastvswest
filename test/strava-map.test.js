@@ -13,8 +13,8 @@ import {
   parseRateLimitHeaders,
   startEpochOf,
 } from '../server/strava/map.js';
-import { SYNC_WINDOW_PAD_SECONDS } from '../server/contracts.js';
-import { epochAtEndOfDate, epochAtStartOfDate } from '../server/lib/dates.js';
+import { SYNC_MAX_MONTHS, SYNC_WINDOW_PAD_SECONDS } from '../server/contracts.js';
+import { addMonths, epochAtEndOfDate, epochAtStartOfDate, startOfMonth } from '../server/lib/dates.js';
 import { testConfig } from './helpers/testDb.js';
 import { assertScope, buildAuthorizeUrl, redirectUri } from '../server/strava/authUrl.js';
 import { StravaScopeError } from '../server/strava/client.js';
@@ -320,6 +320,102 @@ test('computeSyncWindow always fetches the CURRENT month, even when the competit
   const w = computeSyncWindow(past, { mode: 'full', nowMs });
   assert.ok(w.afterEpoch <= epochAtStartOfDate('2026-01-01'), 'the configured month stays covered');
   assert.ok(w.beforeEpoch >= nowSeconds, 'the current month is covered too');
+});
+
+test('computeSyncWindow reaches back to months that already hold rides', () => {
+  // THE REGRESSION, reported as "a lot of rides aren't being shown for months like July and
+  // prior". The floor used to be min(configured first month, current month) only. With a
+  // COMPETITION_START still in the future -- the shipped `.env` said 2026-09-01 -- the configured
+  // month is later than the current one, so the floor collapsed onto the first of the CURRENT
+  // month, every month, forever. July was therefore fetched only while July WAS current, and
+  // /athlete/activities has no `modified_after`, so nothing could ever go back for the late
+  // uploads, the edits and the privacy flips. The stored-data extent is what reopens it.
+  const config = testConfig({ COMPETITION_START: '2026-09-01', COMPETITION_END: '2026-09-30' });
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const julyRide = Math.floor(Date.parse('2026-07-14T08:00:00Z') / 1000);
+
+  // First, pin the old behaviour as the bug it was: with no extent to widen from, July is out.
+  const blind = computeSyncWindow(config, { mode: 'full', nowMs });
+  assert.ok(julyRide < blind.afterEpoch, 'precondition: without dataMonths, July is unreachable');
+
+  // Now the fix. The rider has rides stored back to March, so March onward must be re-fetched.
+  const w = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: '2026-03', last: '2026-08' } });
+  assert.ok(w.afterEpoch <= epochAtStartOfDate('2026-03-01'), 'March 1 is not covered');
+  assert.ok(julyRide > w.afterEpoch && julyRide < w.beforeEpoch, 'a mid-July ride is outside the window');
+  assert.equal(w.trimmedFrom, null, 'a 6-month history is nowhere near the cap');
+  // The clamp that keeps `after` legal has to survive the widening.
+  assert.ok(w.afterEpoch <= Math.floor(nowMs / 1000), 'after must never be in the future');
+  assert.ok(w.beforeEpoch > w.afterEpoch, 'window inverted');
+});
+
+test('computeSyncWindow uses dataMonths as a FLOOR, so it can only ever widen', () => {
+  // The competition is 2026-06-01..2026-08-31. A rider who only has August rides must not drag
+  // the floor UP to August: June and July are configured months and stay fetchable, which is
+  // what lets a rider who joins late still have their earlier rides collected.
+  const config = testConfig();
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+
+  const wide = computeSyncWindow(config, { mode: 'full', nowMs });
+  const narrow = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: '2026-08', last: '2026-08' } });
+  assert.equal(narrow.afterEpoch, wide.afterEpoch, 'a late first-ride month must not raise the floor');
+
+  // And nothing stored at all -- a brand-new athlete -- is the same as not passing it.
+  const empty = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: null, last: null } });
+  assert.equal(empty.afterEpoch, wide.afterEpoch, 'a null extent must not change the window');
+});
+
+test('computeSyncWindow caps the floor at SYNC_MAX_MONTHS and reports the trim', () => {
+  // `dataMonths.first` comes from a substr over stored `local_date` values, so ONE row with a
+  // corrupt start_date_local is enough to ask Strava for a millennium of pages -- for every
+  // rider, on every sync. The cap is not decoration, and it must not be silent either: a
+  // trimmed window still reports `ok` and still reconciles, so without `trimmedFrom` a rider
+  // whose history exceeds the cap looks fully synced.
+  const config = testConfig();
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const w = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: '1026-05', last: '2026-08' } });
+
+  const expectedFloor = addMonths('2026-08', -(SYNC_MAX_MONTHS - 1));
+  assert.equal(w.afterEpoch, epochAtStartOfDate(startOfMonth(expectedFloor)) - SYNC_WINDOW_PAD_SECONDS);
+  assert.deepEqual(w.trimmedFrom, {
+    requested_first_month: '1026-05',
+    first_month: expectedFloor,
+    max_months: SYNC_MAX_MONTHS,
+  });
+
+  // The cap applies to a fat-fingered CONFIG floor too, not just to derived data.
+  const typo = testConfig({ COMPETITION_START: '1900-01-01', COMPETITION_END: '2026-08-31' });
+  const t = computeSyncWindow(typo, { mode: 'full', nowMs });
+  assert.equal(t.trimmedFrom?.requested_first_month, '1900-01');
+  assert.equal(t.afterEpoch, epochAtStartOfDate(startOfMonth(expectedFloor)) - SYNC_WINDOW_PAD_SECONDS);
+});
+
+test('computeSyncWindow ignores an unusable dataMonths.first rather than honouring it', () => {
+  // A 13th month cannot be ordered against anything sensibly. Ignoring it degrades to the
+  // config-plus-clock floor; honouring it would either invert the range or ask for year 1026.
+  const config = testConfig();
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const baseline = computeSyncWindow(config, { mode: 'full', nowMs });
+
+  for (const first of ['1026-13', '2026-1', 'nonsense', '', null, undefined, 42, {}]) {
+    const w = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first, last: '2026-08' } });
+    assert.equal(w.afterEpoch, baseline.afterEpoch, `dataMonths.first=${JSON.stringify(first)} changed the window`);
+    assert.equal(w.trimmedFrom, null, `dataMonths.first=${JSON.stringify(first)} reported a bogus trim`);
+  }
+});
+
+test('computeSyncWindow incremental stays cheap even with a wide stored history', () => {
+  // The widening is a FULL-mode concern. Incremental still starts at the watermark, or the whole
+  // point of having two modes is lost: every Refresh click would re-page two years of rides.
+  const config = testConfig({ COMPETITION_START: '2026-09-01', COMPETITION_END: '2026-09-30' });
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const watermarkEpoch = Math.floor(Date.parse('2026-08-04T09:00:00Z') / 1000);
+  const dataMonths = { first: '2025-01', last: '2026-08' };
+
+  const inc = computeSyncWindow(config, { mode: 'incremental', watermarkEpoch, nowMs, dataMonths });
+  assert.equal(inc.afterEpoch, watermarkEpoch - SYNC_WINDOW_PAD_SECONDS);
+
+  const full = computeSyncWindow(config, { mode: 'full', watermarkEpoch, nowMs, dataMonths });
+  assert.ok(full.afterEpoch < inc.afterEpoch, 'full mode must still ignore the watermark and go wide');
 });
 
 test('computeSyncWindow never sends a future `after`, whenever "now" falls', () => {

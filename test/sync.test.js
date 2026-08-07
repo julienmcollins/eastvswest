@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { freshDb, testConfig, seedAthlete } from './helpers/testDb.js';
+import { freshDb, testConfig, seedActivity, seedAthlete } from './helpers/testDb.js';
 import { createFakeStrava, ACTIVITY_FIXTURE } from './helpers/fakeStrava.js';
 import { createStravaClient, StravaError } from '../server/strava/client.js';
 import { syncAthlete, sweepStaleSyncLocks } from '../server/strava/sync.js';
@@ -55,11 +55,11 @@ const JUN = EXPECTED.by_month['2026-06'];
 
 setLogSink(() => {});
 
-async function setup({ fakeOpts = {}, seedTokens = true } = {}) {
+async function setup({ fakeOpts = {}, seedTokens = true, configOverrides = {} } = {}) {
   _resetSingleFlightForTests();
 
   const db = await freshDb();
-  const config = testConfig();
+  const config = testConfig(configOverrides);
   const fake = createFakeStrava({ now: () => NOW, logger: { error() {} }, ...fakeOpts });
   const strava = createStravaClient({
     apiBase: config.stravaApiBase,
@@ -99,6 +99,83 @@ async function countRows(db, where = '', params = []) {
   const row = await db.get(`SELECT COUNT(*) AS n FROM activities${where ? ` WHERE ${where}` : ''}`, params);
   return Number(row.n);
 }
+
+// ------------------------------------------------------- the widened fetch floor
+
+test('a full sync fetches back to the months that already hold rides', async () => {
+  // THE REGRESSION, reported as "a lot of rides aren't being shown for months like July and
+  // prior". `computeSyncWindow` floors the fetch range at the earliest of {configured first
+  // month, current month, first month holding rides}. Before that third source existed, a
+  // COMPETITION_START in the future -- which is what shipped -- pushed the floor onto the first
+  // of the CURRENT month, every month, forever. Since /athlete/activities has no
+  // `modified_after`, the full rescan that exists to catch late uploads and privacy flips never
+  // went back for July, so July's board froze at whatever was fetched while July was current.
+  //
+  // This is the wiring half of the fix: map.js can compute the widened floor, but only sync.js
+  // can read the extent to compute it FROM, and a window that is right in a unit test and never
+  // reaches the client is the same outage.
+  const ctx = await setup({ configOverrides: { COMPETITION_START: '2026-12-01', COMPETITION_END: '2026-12-31' } });
+
+  // A stored July ride is the only thing that can pull the floor back: NOW is 2026-09-02 and
+  // the configured season is December, so config and clock alone floor this at September 1.
+  await seedActivity(ctx.db, { id: 99000001, athleteId: ATHLETE_ID, localDate: '2026-07-04' });
+
+  await sync(ctx, { mode: 'full' });
+
+  const pages = ctx.fake.requests.filter((r) => r.pathname.endsWith('/athlete/activities'));
+  assert.ok(pages.length > 0, 'no activity page was requested at all');
+
+  const julyFirst = Math.floor(Date.parse('2026-07-01T00:00:00Z') / 1000);
+  for (const page of pages) {
+    const after = Number(page.query.after);
+    assert.ok(
+      after <= julyFirst,
+      `asked Strava for after=${new Date(after * 1000).toISOString()}, which misses July`,
+    );
+    // Every page must carry the SAME bounds. Paging with a moving window silently skips
+    // records, because page N means different rides once the filter changes underneath it.
+    assert.equal(page.query.after, pages[0].query.after);
+    assert.equal(page.query.before, pages[0].query.before);
+  }
+
+  // And the rides really landed: the fixture's July records are now stored, which is the
+  // outcome the rider was reporting as missing. Counted off the fixture rather than hardcoded,
+  // because this is EVERY July record (rule 1: store everything) and not the 6 countable ones
+  // that `JUL.records` describes. The seeded row is excluded -- Strava does not report it, so a
+  // full sync correctly reconciles it away; that is the next test's subject.
+  const julyInFixture = ACTIVITY_FIXTURE.activities
+    .filter((a) => String(a.start_date_local).startsWith('2026-07')).length;
+  assert.equal(
+    await countRows(ctx.db, `local_date LIKE '2026-07-%' AND strava_activity_id != ? AND deleted_at IS NULL`, [99000001]),
+    julyInFixture,
+  );
+});
+
+test('the widened window reconciles the months it now actually fetched', async () => {
+  // The other edge of the same change. Widening the fetch range widens the reconcile range with
+  // it -- they are both derived from the one `window` object, which is what keeps
+  // `reconcile ⊆ fetch` true by construction rather than by review. That is required, not
+  // incidental: a ride the rider deleted in July has to stop counting, and before the widening
+  // it could not, because July was outside the range reconciliation was allowed to touch.
+  const ctx = await setup({ configOverrides: { COMPETITION_START: '2026-12-01', COMPETITION_END: '2026-12-31' } });
+
+  // Two rows Strava does not report: one in July (now inside the fetched range, so it must be
+  // soft-deleted) and one in a month nothing was ever stored for, far below the floor.
+  await seedActivity(ctx.db, { id: 99000002, athleteId: ATHLETE_ID, localDate: '2026-07-04' });
+  await seedActivity(ctx.db, { id: 99000003, athleteId: ATHLETE_ID, localDate: '2020-01-15' });
+
+  const res = await sync(ctx, { mode: 'full' });
+  assert.equal(res.truncated, false, 'precondition: reconciliation only runs on a complete fetch');
+
+  const stale = await getActivity(ctx.db, 99000002);
+  assert.notEqual(stale.deleted_at, null, 'a July row Strava no longer reports must be soft-deleted');
+
+  // Untouched, because it is outside the window that was actually fetched. Soft-deleting it
+  // would be reconciliation deleting rides nobody looked for -- the failure that the
+  // `reconcile ⊆ fetch` invariant exists to prevent.
+  const ancient = await getActivity(ctx.db, 99000003);
+  assert.equal(ancient.deleted_at, null, 'a row outside the fetch window must never be reconciled away');
+});
 
 // ------------------------------------------------------- the whole fixture, end to end
 

@@ -16,6 +16,7 @@
     "keygen": "node scripts/keygen.mjs",
     "make-admin": "node scripts/make-admin.mjs",
     "reset-db": "node scripts/reset-db.mjs",
+    "backfill": "node scripts/backfill.mjs",
     "probe": "node scripts/strava-probe.mjs"
   },
   "devDependencies": {
