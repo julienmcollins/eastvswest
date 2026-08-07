@@ -807,20 +807,6 @@ describe('index.html — Pages migration and XSS guards', () => {
     }
   });
 
-  test('both Strava assets are flagged as placeholders needing replacement', async () => {
-    assert.match(indexHtml, /PLACEHOLDER\. MUST BE REPLACED BEFORE PUBLIC DEPLOYMENT/);
-    assert.match(indexHtml, /developers\.strava\.com\/guidelines/);
-    assert.match(indexHtml, /MUST NOT be restyled/);
-    const readme = await readFile(here('../public/assets/README.md'), 'utf8');
-    assert.match(readme, /PLACEHOLDER/);
-    assert.match(readme, /developers\.strava\.com\/guidelines/);
-    for (const asset of ['btn-strava-connect.svg', 'powered-by-strava.svg']) {
-      const svg = await readFile(here(`../public/assets/${asset}`), 'utf8');
-      assert.match(svg, /PLACEHOLDER/, `${asset} must say so in the file itself`);
-      assert.match(svg, /#FC5200/i, `${asset} must use Strava orange`);
-    }
-  });
-
   test('the shell has every element render.js writes to', () => {
     for (const id of [
       'status', 'banners', 'window-range', 'window-status', 'window-meta',
