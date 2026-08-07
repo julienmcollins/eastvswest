@@ -52,7 +52,7 @@ server/routes/health.js          GET /api/health, GET /api/health/strava (admin)
 server/routes/auth.js            login, reconnect, callback, logout.
 server/routes/me.js              GET /api/me, POST /api/me/team, POST /api/me/sync, POST /api/me/disconnect, DELETE /api/me.
 server/routes/leaderboard.js     GET /api/leaderboard, GET /api/riders/:athleteId/activities.
-server/routes/admin.js           GET /api/admin/athletes, POST /api/admin/athletes/:id/team, POST /api/admin/athletes/:id/admin, POST /api/admin/activities/:id/approve.
+server/routes/admin.js           GET /api/admin/athletes, POST /api/admin/athletes/:id/team, POST /api/admin/athletes/:id/admin, POST /api/admin/athletes/:id/sync (the backfill), GET /api/admin/months, POST /api/admin/activities/:id/approve.
 
 server/lib/units.js              metersToMiles, round1.
 server/lib/dates.js              todayInCompetitionTz(cfg), resolveWindow(cfg,query) clamped to the configured window, epochSeconds, isoUtcNow.
@@ -343,6 +343,8 @@ Conventions binding on both halves:
 | POST | `/api/admin/athletes/:athleteId/team` | session+admin | yes | `{"team":"WEST"}` | `{"ok":true}` — also `deleteSessionsForAthlete` | 200, 400, 401, 403, 404 |
 | POST | `/api/admin/athletes/:athleteId/admin` | session+admin | yes | `{"is_admin":false}` | `{"ok":true}` — revocation drops that athlete's sessions | 200, 401, 403, 404 |
 | POST | `/api/admin/activities/:activityId/approve` | session+admin | yes | `{"approved":true}` | `{"ok":true}` — flips `manual_approved` | 200, 401, 403, 404 |
+| POST | `/api/admin/athletes/:athleteId/sync` | session+admin | yes | `{}` or `{"mode":"full"\|"incremental","since_month":"2026-01"\|null}` (defaults: `mode:"full"`, `since_month` = `COMPETITION_START`'s month; an explicit `null` means "no override, use the union floor") | `{"ok":true,"athlete_id","display_name","mode","since_month","fetched_from_month","synced_at","activities_scanned","activities_added","activities_removed","pages_fetched","truncated","months":[{month,ride_count,meters}]}` — the backfill. `since_month` overrides the fetch floor outright, which is the only way to reach a month holding no rides yet; `fetched_from_month` is the floor after clamping to the current month and to `SYNC_MAX_MONTHS`. `months` is the per-month evidence, scoped to this rider. | 200, 400, 401, 403, 404, 409 `sync_in_progress`, 429 `rate_limited`, 502 `strava_unavailable` |
+| GET | `/api/admin/months` | session+admin | – | – | `{"today","current_month","first_month","last_month","competition_first_month","competition_last_month","months":[{month,ride_count,meters}]}` — spends no Strava quota. `competition_first_month` beside `first_month` is the diagnostic that separates "the sync is broken" from "`COMPETITION_START` is too late". | 200, 401, 403 |
 | OPTIONS | `/api/*` | none | – | preflight | `204` + `Access-Control-Allow-Origin` (exact echo from allowlist, never `*`), `-Allow-Credentials: true`, `-Allow-Methods: GET,POST,DELETE,OPTIONS`, `-Allow-Headers: Content-Type, Authorization, X-CSRF-Token`, `-Max-Age: 86400`, `Vary: Origin, Access-Control-Request-Headers` | 204 |
 
 Body limit on every mutating route: **64 KiB**, enforced against the byte stream (a lying `Content-Length` is the attack). Over-limit ⇒ the 413 JSON is written **first**, then `req.destroy()` — destroying the socket first means the client sees `ECONNRESET`, not a diagnosable error.

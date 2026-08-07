@@ -330,6 +330,75 @@ Then in a browser at the frontend URL (`https://www.example.com`, or
 
 ---
 
+## 4. Back-filling history
+
+`npm run backfill` is how you recover months that were never downloaded. Two things about it
+are load-bearing and were both learned the hard way.
+
+**It must be run with `--remote`.** Without that flag it opens the local sqlite file at
+`DATABASE_PATH` — not D1. On a machine with no `.env` and no `./data/`, that meant it migrated
+an empty file, found no athletes, printed "No athletes to back-fill yet." and exited 0. Every
+run looked fine and production was never touched. Local mode now names the file it is opening,
+but `--remote` is the only mode that reaches deployed data.
+
+**A bare run only reaches `COMPETITION_START`'s month.** The fetch floor is the earliest of
+`{COMPETITION_START's month, the current month, the first month that already HOLDS rides}`, and
+that third source is derived from the rows the fetch itself writes — so it can only widen to a
+month that already has data. A month never fetched is invisible to all three, and re-running
+changes nothing. `--since` is the only way in.
+
+First, get an admin session token: sign in on the frontend as a rider listed in
+`ADMIN_BOOTSTRAP_ATHLETE_IDS`, then read `localStorage['bc_token']` in the browser console. It
+lasts `SESSION_TTL_SECONDS` (12 h).
+
+```bash
+export API=https://api.example.com          # or https://<name>.<sub>.workers.dev
+export WEB_ORIGIN=https://www.example.com   # must match the server's allowlist
+export ADMIN_SESSION_TOKEN=<bc_token>
+
+# What does each month hold right now? Spends no Strava quota.
+curl -s -H "Authorization: Bearer $ADMIN_SESSION_TOKEN" "$API/api/admin/months" | jq
+
+# Who would be synced.
+npm run backfill -- --remote --dry-run
+
+# Recover everything back to January.
+npm run backfill -- --remote --since 2026-01
+```
+
+Read the per-month table it prints, not the `+added` total: one number for a window spanning
+eight months cannot tell a complete recovery from a two-month one. The script names any month
+inside the range with no counted rides at all, which is the finding worth acting on.
+
+Two lines in the output need interpreting:
+
+- **`fetched from <month>` differs from what you asked for.** `--since` is clamped to the
+  current month (a floor in the future can only select months nobody has ridden yet) and to
+  `SYNC_MAX_MONTHS` = 24. This matters for a bare run: with `COMPETITION_START` in the future
+  the default floor *is* a future month, so a default backfill reaches only the current one.
+- **`[TRUNCATED]`.** The window exceeded `STRAVA_MAX_PAGES` × `STRAVA_PAGE_SIZE` (40 × 200), so
+  nothing was reconciled for that rider and a bare re-run computes the identical window. Go in
+  chunks with a later `--since`.
+
+`--since` (and the default) **replaces** the floor rather than joining it, so it can narrow as
+well as widen. That is deliberate — narrowing is the chunking escape hatch above, and it is safe
+because the fetch window is also the reconcile window, so a narrow run can only reconcile the
+months it actually asked Strava about. The practical consequence: if stored data already reaches
+further back than `COMPETITION_START`, a *default* backfill will not go past the configured
+month. Pass the month you want.
+
+If a whole month is empty for *every* rider, check `competition_first_month` in
+`/api/admin/months` before suspecting the sync: a floor later than the month you want means the
+problem is `COMPETITION_START`, and editing `wrangler.toml` does nothing until you
+`wrangler deploy`.
+
+Both endpoints sit behind the `/api/admin` prefix guard. `POST
+/api/admin/athletes/:athleteId/sync` is the one route in the tree that can spend Strava quota
+and soft-delete another rider's rides — the fetch window is also the reconcile window, which is
+why `POST /api/me/sync` deliberately does not forward the month a rider is looking at.
+
+---
+
 ## Known gaps
 
 - **The D1 and Worker adapters have never run against real Cloudflare infrastructure.** They
@@ -356,5 +425,7 @@ Then in a browser at the frontend URL (`https://www.example.com`, or
   the 12 h session TTL, not removed by it. See "What you are accepting" above.
 - **`COMPETITION_START`/`END` still bound the Strava fetch window**, so months outside it are
   only browsable once rides have been fetched into them. Set the range to cover the season you
-  actually want downloaded.
+  actually want downloaded — and remember that editing `wrangler.toml` takes effect only after
+  `wrangler deploy`, and never retroactively. Recovering months an earlier narrow window skipped
+  needs `npm run backfill -- --remote --since <month>`; see step 4.
 - **Action versions are `[UNVERIFIED]`** — pinned without network access.

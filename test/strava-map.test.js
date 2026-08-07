@@ -441,6 +441,170 @@ test('computeSyncWindow rejects a bogus mode', () => {
   assert.throws(() => computeSyncWindow(testConfig(), { mode: 'quick' }), TypeError);
 });
 
+// ------------------------------------------------------- computeSyncWindow: sinceMonth
+
+test('computeSyncWindow honours sinceMonth with NOTHING stored, which no other source can', () => {
+  // THE BUG THE OTHER FLOOR SOURCES CANNOT FIX, reported as "running backfill still doesn't get me
+  // the correct data for months prior to September and August".
+  //
+  // The three-source union is circular: `dataMonths.first` is derived from the rows the fetch
+  // itself writes, so it can only ever widen to a month that ALREADY holds rides. A month that was
+  // never fetched in the first place is invisible to it, the configured floor is in the future, and
+  // the current month is August -- so every source agrees on August and re-running the backfill
+  // computes the identical window forever. `sinceMonth` is the only way out.
+  const config = testConfig({ COMPETITION_START: '2026-09-01', COMPETITION_END: '2026-09-30' });
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const januaryRide = Math.floor(Date.parse('2026-01-14T08:00:00Z') / 1000);
+
+  // The precondition, stated as an assertion so this test fails loudly if the floor ever widens on
+  // its own and stops being the thing sinceMonth is needed for.
+  const stuck = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: null, last: null } });
+  assert.ok(januaryRide < stuck.afterEpoch, 'precondition: January is unreachable without sinceMonth');
+  assert.equal(stuck.afterEpoch, epochAtStartOfDate('2026-08-01') - SYNC_WINDOW_PAD_SECONDS);
+
+  const w = computeSyncWindow(config, {
+    mode: 'full',
+    nowMs,
+    dataMonths: { first: null, last: null },
+    sinceMonth: '2026-01',
+  });
+  assert.equal(w.afterEpoch, epochAtStartOfDate('2026-01-01') - SYNC_WINDOW_PAD_SECONDS);
+  assert.ok(januaryRide > w.afterEpoch && januaryRide < w.beforeEpoch, 'a mid-January ride is outside the window');
+  assert.equal(w.trimmedFrom, null);
+  // Every month between January and August has to be inside one window, not just the endpoints:
+  // recovering January and August while missing the six between them is the failure mode that
+  // `activityMonthlyTotals` exists to expose, and it must not be reachable from here.
+  for (const month of ['2026-02', '2026-03', '2026-04', '2026-05', '2026-06', '2026-07']) {
+    const mid = Math.floor(Date.parse(`${month}-15T12:00:00Z`) / 1000);
+    assert.ok(mid > w.afterEpoch && mid < w.beforeEpoch, `${month} is not inside the window`);
+  }
+});
+
+test('computeSyncWindow lets sinceMonth NARROW the window too, not only widen it', () => {
+  // Unconditional in both directions on purpose. Narrowing is the manual chunking escape hatch for
+  // a rider whose history exceeds STRAVA_MAX_PAGES, where a bare re-run recomputes the identical
+  // truncating window forever. It is safe precisely because the fetch window is also the reconcile
+  // range, so a narrow fetch can only reconcile the months it actually asked Strava about.
+  const config = testConfig(); // 2026-06-01 .. 2026-08-31
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+
+  const wide = computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: '2025-01', last: '2026-08' } });
+  const narrow = computeSyncWindow(config, {
+    mode: 'full',
+    nowMs,
+    dataMonths: { first: '2025-01', last: '2026-08' },
+    sinceMonth: '2026-08',
+  });
+
+  assert.ok(narrow.afterEpoch > wide.afterEpoch, 'sinceMonth did not narrow anything');
+  assert.equal(narrow.afterEpoch, epochAtStartOfDate('2026-08-01') - SYNC_WINDOW_PAD_SECONDS);
+  // The upper bound is untouched: narrowing the floor must not stop the current month being fetched.
+  assert.equal(narrow.beforeEpoch, wide.beforeEpoch);
+});
+
+test('computeSyncWindow clamps sinceMonth to SYNC_MAX_MONTHS and reports it', () => {
+  // `--since 1990-01` is a typo, not a request. It has to be clamped like every other floor source
+  // AND reported, because a trimmed window still returns `ok` and still reconciles -- a silent cap
+  // reads as "we fetched everything" when it did not.
+  const config = testConfig();
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+  const expectedFloor = addMonths('2026-08', -(SYNC_MAX_MONTHS - 1));
+
+  const w = computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: '1990-01' });
+  assert.equal(w.afterEpoch, epochAtStartOfDate(startOfMonth(expectedFloor)) - SYNC_WINDOW_PAD_SECONDS);
+  assert.deepEqual(w.trimmedFrom, {
+    requested_first_month: '1990-01',
+    first_month: expectedFloor,
+    max_months: SYNC_MAX_MONTHS,
+  });
+});
+
+test('computeSyncWindow THROWS on a malformed sinceMonth rather than falling back', () => {
+  // Unlike `dataMonths.first`, which is derived from stored rows and is tolerated when corrupt,
+  // this one is a human typing a month on a command line. Silently falling back to the union would
+  // run a backfill that reports success while covering exactly the range that was already broken --
+  // the operator would conclude the data is genuinely missing upstream.
+  const config = testConfig();
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+
+  for (const bad of ['2026-13', '2026-1', '2026', 'nonsense', '', 42, {}, '2026-00']) {
+    assert.throws(
+      () => computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: bad }),
+      TypeError,
+      `sinceMonth=${JSON.stringify(bad)} was accepted`,
+    );
+  }
+
+  // null and undefined are the documented "no override" values and must NOT throw.
+  const baseline = computeSyncWindow(config, { mode: 'full', nowMs });
+  for (const absent of [null, undefined]) {
+    assert.deepEqual(computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: absent }), baseline);
+  }
+});
+
+test('computeSyncWindow keeps `after` legal for any sinceMonth, including future ones', () => {
+  // A future sinceMonth is not exotic -- it is the DEFAULT. The admin route defaults `since_month`
+  // to COMPETITION_START's month, and a season that has not begun (September, configured in
+  // August) puts that month in the future. An override honoured literally would then floor the
+  // fetch at September 1, `after` would clamp to now, and every sync would ask Strava for "rides
+  // between now and tomorrow" -- succeeding, reporting ok, storing NOTHING. That is the original
+  // bug, reachable through its own fix, which is why the floor is min(sinceMonth, currentMonth).
+  const config = testConfig();
+  for (const today of ['2026-05-30', '2026-08-05', '2027-06-01']) {
+    const nowMs = Date.parse(`${today}T12:00:00Z`);
+    const nowSeconds = Math.floor(nowMs / 1000);
+    const currentMonth = today.slice(0, 7);
+    for (const since of ['2026-01', '2026-08', '2027-01', '2030-12']) {
+      for (const mode of ['full', 'incremental']) {
+        const w = computeSyncWindow(config, { mode, nowMs, sinceMonth: since });
+        assert.ok(w.afterEpoch <= nowSeconds, `${mode} @${today} since=${since}: after is in the future`);
+        assert.ok(w.afterEpoch >= 0, `${mode} @${today} since=${since}: negative after`);
+        assert.ok(w.beforeEpoch > w.afterEpoch, `${mode} @${today} since=${since}: window inverted`);
+      }
+
+      // Full mode must ALWAYS still cover the current month, whatever was asked for. The reported
+      // floor is the effective one, so a clamped request reads as the month it really fetched.
+      const w = computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: since });
+      const expectedFloor = since < currentMonth ? since : currentMonth;
+      assert.equal(w.firstMonth, expectedFloor, `@${today} since=${since}: wrong effective floor`);
+      assert.ok(
+        w.afterEpoch <= epochAtStartOfDate(`${currentMonth}-01`),
+        `@${today} since=${since}: the current month fell out of its own window`,
+      );
+      // And a ride in the middle of the current month is genuinely inside the range, which is the
+      // property "the floor covers it" is standing in for.
+      const midMonth = Math.floor(Date.parse(`${currentMonth}-15T12:00:00Z`) / 1000);
+      if (midMonth <= nowSeconds) {
+        assert.ok(midMonth > w.afterEpoch && midMonth < w.beforeEpoch, `@${today} since=${since}: mid-month ride excluded`);
+      }
+    }
+  }
+});
+
+test('computeSyncWindow reports the floor it USED, not the one it was given', () => {
+  // An ops tool prints this, so it has to be the result rather than the request. The three ways
+  // they diverge are all here: no override, a clamped-to-current override, and a capped one.
+  const config = testConfig(); // 2026-06-01 .. 2026-08-31
+  const nowMs = Date.parse('2026-08-05T17:00:00Z');
+
+  assert.equal(computeSyncWindow(config, { mode: 'full', nowMs }).firstMonth, '2026-06');
+  assert.equal(computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: '2026-02' }).firstMonth, '2026-02');
+  assert.equal(
+    computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: '2026-11' }).firstMonth,
+    '2026-08',
+    'a future floor is reported as the current month, because that is what was fetched',
+  );
+  assert.equal(
+    computeSyncWindow(config, { mode: 'full', nowMs, sinceMonth: '1990-01' }).firstMonth,
+    addMonths('2026-08', -(SYNC_MAX_MONTHS - 1)),
+  );
+  // The stored-data floor shows up here too, so a log line can say which source won.
+  assert.equal(
+    computeSyncWindow(config, { mode: 'full', nowMs, dataMonths: { first: '2026-03', last: '2026-08' } }).firstMonth,
+    '2026-03',
+  );
+});
+
 // ------------------------------------------------------------------ rate-limit headers
 
 test('parseRateLimitHeaders reads both pairs from a Headers instance', () => {

@@ -770,6 +770,15 @@ test('a non-admin is 403 on every /api/admin route and on /api/health/strava', a
   const approve = await post(app, '/api/admin/activities/15000000014/approve', { approved: true }, auth);
   assert.equal(approve.status, 403);
 
+  // The backfill routes are guarded by the same prefix predicate and by nothing of their own --
+  // asserted here rather than trusted, because `/api/admin/athletes/:id/sync` is the one route in
+  // the tree that can spend Strava quota and soft-delete another rider's rides.
+  const backfill = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, { since_month: '2026-06' }, auth);
+  assert.equal(backfill.status, 403);
+
+  const months = await call(app, { method: 'GET', url: '/api/admin/months', cookies: { bc_sid: auth.sid } });
+  assert.equal(months.status, 403);
+
   const health = await call(app, { method: 'GET', url: '/api/health/strava', cookies: { bc_sid: auth.sid } });
   assert.equal(health.status, 403);
 
@@ -777,6 +786,17 @@ test('a non-admin is 403 on every /api/admin route and on /api/health/strava', a
   // client opens the Connect flow for one and shows an error for the other.
   const anon = await call(app, { method: 'GET', url: '/api/admin/athletes' });
   assert.equal(anon.status, 401);
+  // A double-submit pair with no session: an anonymous browser genuinely has a bc_csrf cookie, so
+  // this clears the CSRF guard and reaches requireAdmin, which is the guard under test. Without the
+  // pair it would 403 on CSRF and say nothing about admin at all.
+  const anonSync = await call(app, {
+    method: 'POST',
+    url: `/api/admin/athletes/${RIDER_ID}/sync`,
+    body: {},
+    headers: { origin: ORIGIN, 'x-csrf-token': 'anon-csrf' },
+    cookies: { bc_csrf: 'anon-csrf' },
+  });
+  assert.equal(anonSync.status, 401);
 });
 
 test('an admin can list athletes, move a rider, flip admin, and approve a manual ride', async () => {
@@ -826,6 +846,188 @@ test('an admin can list athletes, move a rider, flip admin, and approve a manual
   assert.equal(Number((await getAthlete(db, RIDER_ID)).is_admin), 0);
   const afterDemote = await call(app, { method: 'GET', url: '/api/me', cookies: { bc_sid: auth.sid } });
   assert.equal(afterDemote.json.authenticated, false);
+});
+
+test('POST /api/admin/athletes/:id/sync back-fills a month nothing was ever stored for', async () => {
+  // The end-to-end version of the reported bug, over HTTP, which is the only path that reaches
+  // production: `scripts/backfill.mjs` used to open a local sqlite file while the deployed data
+  // sat in D1, so it could never have fixed anything.
+  //
+  // COMPETITION_START is pushed into the future, which is what shipped. The fetch floor then
+  // collapses onto the current month and the three-source union cannot widen -- `dataMonths.first`
+  // is derived from the rows the fetch writes, so an empty table keeps it empty forever.
+  const { app, fake } = await harness({
+    configOverrides: {
+      ADMIN_BOOTSTRAP_ATHLETE_IDS: String(RIDER_ID),
+      COMPETITION_START: '2026-12-01',
+      COMPETITION_END: '2026-12-31',
+    },
+  });
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+
+  // The stuck state, through the rider's own Refresh: succeeds, stores no July.
+  const ordinary = await post(app, '/api/me/sync', { mode: 'full' }, auth);
+  assert.equal(ordinary.status, 200);
+  const before = await call(app, { method: 'GET', url: '/api/admin/months', cookies: { bc_sid: auth.sid } });
+  assert.equal(before.status, 200);
+  assert.equal(before.json.competition_first_month, '2026-12');
+  assert.ok(
+    !before.json.months.some((m) => m.month === '2026-07'),
+    'precondition: July is unreachable, which is why re-running a backfill never helped',
+  );
+
+  // Now the backfill, naming the month.
+  const res = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, { since_month: '2026-06' }, auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.ok, true);
+  assert.equal(res.json.mode, 'full');
+  assert.equal(res.json.since_month, '2026-06');
+  assert.equal(res.json.athlete_id, RIDER_ID);
+  assert.equal(res.json.truncated, false);
+  assert.ok(res.json.activities_added > 0);
+
+  // The exact key set `scripts/backfill.mjs --remote` reads. Asserted as a contract because the
+  // script is the only consumer and it is not exercised by any test: a rename here would surface
+  // as a backfill silently reporting "0 scanned, +0 added" for every rider while working fine.
+  for (const key of ['activities_scanned', 'activities_added', 'activities_removed', 'pages_fetched', 'truncated', 'since_month', 'fetched_from_month', 'months']) {
+    assert.ok(key in res.json, `the backfill script reads ${key}, which is missing`);
+  }
+  assert.equal(typeof res.json.activities_scanned, 'number');
+  assert.equal(typeof res.json.pages_fetched, 'number');
+
+  // THE EVIDENCE. Every month in the fixture, with counts that match the board -- not one
+  // aggregate `+added` that cannot tell a complete recovery from a two-month one.
+  //
+  // May and September are in the list, and correctly so: sync stores everything it fetches
+  // regardless of the configured season (sync.js rule 1), the window is padded a day on each end,
+  // and every calendar month is its own competition -- so the fixture's May 31 and September 1
+  // boundary rides really do have their own boards to appear on.
+  const byMonth = new Map(res.json.months.map((m) => [m.month, m]));
+  assert.deepEqual(
+    [...byMonth.keys()],
+    ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09'],
+    'a month is missing, which is the failure this endpoint exists to surface',
+  );
+  assert.equal(byMonth.get('2026-06').ride_count, FIXTURE.expected.by_month['2026-06'].records);
+  assert.equal(byMonth.get('2026-07').ride_count, JUL.records);
+  assert.equal(byMonth.get('2026-08').ride_count, AUG.records);
+
+  // And the board itself now serves July, which is what the rider was reporting as broken.
+  const july = await call(app, { method: 'GET', url: '/api/leaderboard?month=2026-07' });
+  assert.equal(july.json.competition.month, '2026-07');
+  assert.equal(july.json.totals.miles, JUL.miles);
+
+  // GET /api/admin/months agrees, and reports the config floor alongside the data floor -- the
+  // diagnostic that says whether a gap is a sync problem or a COMPETITION_START problem.
+  const after = await call(app, { method: 'GET', url: '/api/admin/months', cookies: { bc_sid: auth.sid } });
+  assert.equal(after.json.current_month, '2026-08');
+  assert.equal(after.json.competition_first_month, '2026-12', 'config is unchanged; only the data moved');
+  assert.deepEqual(after.json.months.map((m) => m.month), [...byMonth.keys()]);
+});
+
+test('the admin sync defaults its floor from the SERVER config, and validates the month', async () => {
+  const { app, fake } = await harness({ configOverrides: { ADMIN_BOOTSTRAP_ATHLETE_IDS: String(RIDER_ID) } });
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+
+  // Absent `since_month` means COMPETITION_START's month (2026-06 in the harness). Defaulted here
+  // rather than by the caller because the floor is a fact about the DEPLOYED config -- a script
+  // computing it from its own `.env` computes it from the wrong one, which is how the September
+  // floor survived a "fix" in the first place.
+  const dflt = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, {}, auth);
+  assert.equal(dflt.status, 200);
+  assert.equal(dflt.json.since_month, '2026-06');
+  assert.equal(dflt.json.mode, 'full', 'not auto: auto would pick incremental for exactly these riders');
+
+  // An explicit null is a DIFFERENT request from an absent field: "no override, use the union".
+  const union = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, { since_month: null }, auth);
+  assert.equal(union.status, 200);
+  assert.equal(union.json.since_month, null);
+
+  // Strictly validated, exactly as `?month=` is on the read routes.
+  for (const bad of ['2026-13', '2026-1', '2026', 'nonsense', '2026-00']) {
+    const res = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, { since_month: bad }, auth);
+    assert.equal(res.status, 400, `since_month=${bad} was accepted`);
+    assert.equal(res.json.error, 'bad_request');
+  }
+
+  const badMode = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, { mode: 'quick' }, auth);
+  assert.equal(badMode.status, 400);
+
+  const notFound = await post(app, '/api/admin/athletes/999/sync', {}, auth);
+  assert.equal(notFound.status, 404);
+});
+
+test('a DEFAULT backfill with a future COMPETITION_START still fetches, and says which month', async () => {
+  // The bug reachable through its own fix. `since_month` defaults to COMPETITION_START's month, and
+  // a season that has not begun puts that month in the FUTURE. Honoured literally, the floor would
+  // be December 1, `after` would clamp to now, and the backfill would ask Strava for "rides between
+  // now and tomorrow" -- 200 OK, `ok: true`, nothing stored. Indistinguishable from the failure it
+  // was meant to repair, and reported as success.
+  const { app, fake } = await harness({
+    configOverrides: {
+      ADMIN_BOOTSTRAP_ATHLETE_IDS: String(RIDER_ID),
+      COMPETITION_START: '2026-12-01',
+      COMPETITION_END: '2026-12-31',
+    },
+  });
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+
+  const res = await post(app, `/api/admin/athletes/${RIDER_ID}/sync`, {}, auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.since_month, '2026-12', 'the request really was for a future month');
+  assert.equal(res.json.fetched_from_month, '2026-08', 'clamped to the current month, not honoured literally');
+  // The current month landed, which is the whole point: `activities_added` of 0 here would be the
+  // silent-success failure this asserts against.
+  assert.ok(res.json.activities_added > 0, 'a default backfill stored nothing at all');
+  assert.ok(res.json.months.some((m) => m.month === '2026-08'), 'August is missing from the evidence');
+
+  // And the two fields disagreeing is exactly the signal the script prints, so it must be visible
+  // rather than reconciled away server-side.
+  assert.notEqual(res.json.since_month, res.json.fetched_from_month);
+});
+
+test('a bearer-token admin can drive the backfill, which is what makes the script possible', async () => {
+  // `scripts/backfill.mjs --remote` is a Node client with no cookie jar. It authenticates with
+  // `Authorization: Bearer`, and `requireCsrf` skips the double-submit token for exactly that case
+  // (see the long comment on that branch). Without this working there is no way to reach production
+  // D1 at all, so it is asserted rather than assumed -- including that the Origin leg still applies.
+  const { app, fake } = await harness({ configOverrides: { ADMIN_BOOTSTRAP_ATHLETE_IDS: String(RIDER_ID) } });
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+
+  const bearer = (headers) => call(app, {
+    method: 'POST',
+    url: `/api/admin/athletes/${RIDER_ID}/sync`,
+    body: { since_month: '2026-06' },
+    headers: { authorization: `Bearer ${auth.sid}`, ...headers },
+  });
+
+  const ok = await bearer({ origin: ORIGIN });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.since_month, '2026-06');
+  assert.ok(ok.json.months.length > 0);
+
+  // No Origin is still a 403: the bearer exemption covers the token leg only.
+  const noOrigin = await bearer({});
+  assert.equal(noOrigin.status, 403);
+  assert.equal(noOrigin.json.error, 'csrf_failed');
+
+  const badOrigin = await bearer({ origin: 'https://evil.example' });
+  assert.equal(badOrigin.status, 403);
+
+  // And the read side works the same way, so the script can verify without spending quota.
+  const months = await call(app, {
+    method: 'GET',
+    url: '/api/admin/months',
+    headers: { authorization: `Bearer ${auth.sid}` },
+  });
+  assert.equal(months.status, 200);
+  assert.equal(months.json.competition_first_month, '2026-06');
 });
 
 test('GET /api/health/strava is admin-only and carries no token', async () => {

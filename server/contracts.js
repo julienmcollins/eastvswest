@@ -168,3 +168,15 @@ export const COMPETITION_STATES = Object.freeze({
   OPEN: 'open',
   CLOSED: 'closed',
 });
+
+/**
+ * The `mode` a sync request may ask for. Here rather than beside one route because TWO routes
+ * accept it now -- `POST /api/me/sync` and the admin backfill -- and a second private copy of
+ * the set is how the two drift into disagreeing about what a valid mode is.
+ *
+ * Note this is the WIRE enum, not the internal one: `syncAthlete` additionally accepts `null`
+ * for "auto", which no caller may request explicitly. Auto exists so an ordinary Refresh gets a
+ * cheap incremental most of the time and a full rescan daily; a client that could name it would
+ * be asking the server to decide something it has already decided.
+ */
+export const SYNC_MODES = Object.freeze(['incremental', 'full']);

@@ -179,14 +179,20 @@ async function restorePreviousOutcome(db, athleteId, previous) {
  * @param {object} config frozen config (server/config.js)
  * @param {object} strava client (server/strava/client.js)
  * @param {number} athleteId
- * @param {{mode?: 'full'|'incremental'|null, force?: boolean, nowMs?: number}} [opts]
+ * @param {{mode?: 'full'|'incremental'|null, force?: boolean, nowMs?: number,
+ *   sinceMonth?: string|null}} [opts]
  *   `mode` null means auto: 'full' when `last_full_sync_at` is missing or older than a day.
  *   `force` skips the cooldown only -- never the lock, which exists to stop concurrent runs.
- * @returns {Promise<{ok:true, mode:string, syncedAt:string, activitiesScanned:number,
- *   activitiesCounted:number, activitiesAdded:number, activitiesRemoved:number,
- *   pagesFetched:number, truncated:boolean}>}
+ *   `sinceMonth` (`YYYY-MM`) overrides the fetch floor outright; see `computeSyncWindow`. It is
+ *   the ONLY way to reach a month that holds no rides yet, and therefore the only way to
+ *   recover one that an earlier narrow window skipped. Admin-only -- `POST /api/me/sync` must
+ *   never forward a rider's on-screen month here, because the fetch window is also the
+ *   reconcile window.
+ * @returns {Promise<{ok:true, mode:string, syncedAt:string, firstMonth:string,
+ *   activitiesScanned:number, activitiesCounted:number, activitiesAdded:number,
+ *   activitiesRemoved:number, pagesFetched:number, truncated:boolean}>}
  */
-export async function syncAthlete(db, config, strava, athleteId, { mode = null, force = false, nowMs = Date.now() } = {}) {
+export async function syncAthlete(db, config, strava, athleteId, { mode = null, force = false, nowMs = Date.now(), sinceMonth = null } = {}) {
   const id = Number(athleteId);
   if (!Number.isInteger(id) || id <= 0) {
     throw new TypeError(`syncAthlete: athleteId must be a positive integer, got ${JSON.stringify(athleteId)}.`);
@@ -252,7 +258,7 @@ export async function syncAthlete(db, config, strava, athleteId, { mode = null, 
         : 'incremental');
 
     try {
-      const result = await runSync(db, config, strava, id, { mode: resolvedMode, nowMs, nowEpoch, syncedAt, state });
+      const result = await runSync(db, config, strava, id, { mode: resolvedMode, nowMs, nowEpoch, syncedAt, state, sinceMonth });
 
       await recordOk(db, id, {
         nowEpoch,
@@ -283,7 +289,7 @@ export async function syncAthlete(db, config, strava, athleteId, { mode = null, 
  * Split out so the lock/cooldown/bookkeeping shell above reads as a single sequence and this
  * function can be read as "what we do to the data".
  */
-async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, syncedAt, state }) {
+async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, syncedAt, state, sinceMonth = null }) {
   // ---- identity refresh. Its own withAuth call, so a 401 here retries ONE request rather
   // than re-fetching every activity page.
   const athleteRaw = await withAuth(db, config, strava, athleteId, (token) => strava.getAthlete(token), { nowMs });
@@ -298,17 +304,22 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
   // to `monthBounds`, so a month a reader can select is a month this sync rescans. Reading it here
   // rather than in map.js is the usual split: map.js has no database, and sync.js is the one module
   // that may see both.
+  //
+  // `sinceMonth` overrides all of that when an admin names a month, which is what makes a backfill
+  // able to reach a month holding nothing yet -- the one case the extent query provably cannot,
+  // since it is derived from the very rows the fetch would have written.
   const window = computeSyncWindow(config, {
     mode,
     watermarkEpoch: Number(state?.watermark_epoch ?? 0),
     nowMs,
     dataMonths: await activityMonthExtent(db, config),
+    sinceMonth,
   });
 
   // Logged, never silent: a window clipped by SYNC_MAX_MONTHS still reports `ok` and still
   // reconciles, so without this line a rider whose history exceeds the cap looks fully synced.
   if (window.trimmedFrom) {
-    log.warn('sync window trimmed to SYNC_MAX_MONTHS', { athlete_id: athleteId, mode, ...window.trimmedFrom });
+    log.warn('sync window trimmed to SYNC_MAX_MONTHS', { athlete_id: athleteId, mode, since_month: sinceMonth, ...window.trimmedFrom });
   }
 
   // ---- fetch. A failure mid-pagination is NOT fatal: the pages already in hand are worth
@@ -412,6 +423,13 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
     ok: true,
     mode,
     syncedAt,
+    /**
+     * The floor ACTUALLY fetched from, after every clamp -- not the `sinceMonth` that was asked
+     * for. They differ whenever the request named a month later than the current one or older than
+     * SYNC_MAX_MONTHS, and reporting the request instead would let the backfill claim to have
+     * covered a month it never asked Strava about.
+     */
+    firstMonth: window.firstMonth,
     activitiesScanned: fetched.activities.length,
     activitiesCounted: countCountable(config, rows),
     activitiesAdded,

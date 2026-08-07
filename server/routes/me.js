@@ -1,4 +1,4 @@
-import { API_SCHEMA, ERROR_CODES, SCOPE_READ_ALL, TEAMS } from '../contracts.js';
+import { API_SCHEMA, ERROR_CODES, SCOPE_READ_ALL, SYNC_MODES, TEAMS } from '../contracts.js';
 import { HttpError, sendJson } from '../http/respond.js';
 import { readJsonBody } from '../http/body.js';
 import { requireNotRevoked, requireSession } from '../security/guards.js';
@@ -30,8 +30,6 @@ import { requireMonthParam } from './leaderboard.js';
  */
 
 const STRAVA_ATHLETE_BASE = 'https://www.strava.com/athletes/';
-
-const SYNC_MODES = new Set(['incremental', 'full']);
 
 /**
  * The `rider` block of /api/me. Shape frozen by test/fixtures/me.sample.json.
@@ -168,8 +166,8 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
 
     let mode = null;
     if (body.mode !== undefined && body.mode !== null) {
-      if (!SYNC_MODES.has(body.mode)) {
-        throw new HttpError(400, ERROR_CODES.BAD_REQUEST, `mode must be one of ${[...SYNC_MODES].join(', ')}.`);
+      if (!SYNC_MODES.includes(body.mode)) {
+        throw new HttpError(400, ERROR_CODES.BAD_REQUEST, `mode must be one of ${SYNC_MODES.join(', ')}.`);
       }
       mode = body.mode;
     }
@@ -178,6 +176,12 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
     // covers the whole picker range (one fetch serves every month), but the embedded
     // leaderboard has to come back for the month on screen -- otherwise pressing Refresh
     // while viewing June silently snaps the board to the current month.
+    //
+    // SO IT IS NOT PASSED AS `sinceMonth`, and that omission is deliberate. `sinceMonth`
+    // overrides the fetch floor, and the fetch window is also the RECONCILE window
+    // (server/strava/sync.js rule 3) -- a rider who could name it could ask for a one-month
+    // window while viewing June and have every other month's rides soft-deleted as "no longer
+    // reported by Strava". Only the admin backfill route sets it.
     const month = requireMonthParam(body.month);
 
     let result;
@@ -308,8 +312,13 @@ async function deauthorizeQuietly(ctx, { config, db, strava }, athleteId, nowMs)
  * Order matters: StravaRateLimitError, StravaScopeError and StravaGrantRevokedError are all
  * subclasses of StravaError, so a `StravaError` branch placed first would swallow every one
  * of them into a 502 and the client would show "Strava unavailable" for a revoked grant.
+ *
+ * Exported for routes/admin.js, which runs the same `syncAthlete` and so can raise every one of
+ * these. A second copy of this mapping there is how the admin backfill ends up reporting a
+ * revoked grant as a 502 -- sending the operator to Strava's status page over a rider who simply
+ * needs to reconnect.
  */
-function toHttpError(err, config) {
+export function toHttpError(err, config) {
   const reauthUrl = `${config.apiBaseUrl}/api/auth/strava/reconnect`;
 
   if (err instanceof HttpError) {

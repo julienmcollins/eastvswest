@@ -61,7 +61,12 @@ WEB_BASE_PATH = ""
 # SESSION_TTL_SECONDS <= 86400; the server refuses to boot otherwise.
 AUTH_TOKEN_IN_FRAGMENT = "false"
 STRAVA_CLIENT_ID = "269991"
-COMPETITION_START = "2026-09-01"
+# FLOOR of the month picker, of the Strava fetch window, and of a default backfill. Backdate this
+# to when the competition actually began: a START in the FUTURE collapses the fetch floor onto the
+# first of the current month, so earlier months are never downloaded, and the floor's only other
+# widening source is the data already stored -- so re-syncing can never go back for them. See
+# docs/DEPLOY.md step 4 for recovering months a narrow window already skipped.
+COMPETITION_START = "2026-01-01"
 COMPETITION_END = "2026-09-30"
 COMPETITION_TZ = "UTC"
 ALLOWED_SPORT_TYPES = "Ride,GravelRide,MountainBikeRide,VirtualRide"

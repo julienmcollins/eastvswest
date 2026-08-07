@@ -326,3 +326,57 @@ export async function activityMonthExtent(db, config) {
 export async function selectableMonthBounds(db, config, nowMs = Date.now()) {
   return monthBounds(config, nowMs, await activityMonthExtent(db, config));
 }
+
+/**
+ * One row per month that holds a ride the board would count. THE EVIDENCE A BACKFILL WORKED.
+ *
+ * `activityMonthExtent` above answers "what is the earliest and latest month", which is all the
+ * fetch floor and the month picker need -- and which is exactly the wrong shape for checking a
+ * backfill. A run that recovered January and August but silently missed everything between them
+ * reports the same `{first, last}` as a run that recovered all eight months. A month-by-month
+ * count is the only output that distinguishes them, which is why this exists separately rather
+ * than as an extra column on that query.
+ *
+ * The predicate is the SHARED `countedPredicate` with only its date test opened up -- the same
+ * reuse, and for the same reason, as `activityMonthExtent`: "this month has 12 rides" then means
+ * exactly "12 rides appear on that month's board", rather than counting Runs, soft-deleted rows
+ * and unapproved manual entries that the reader will never see. A verification number that does
+ * not agree with the thing it is verifying is worse than none.
+ *
+ * Meters, not miles. `server/db/leaderboard.js` is the only place in the app that converts, and
+ * rounding here would let a per-month total disagree with the board's headline figure.
+ *
+ * @param {{athleteId?: number|null}} [opts] scope to one rider; null is every rider.
+ * @returns {Promise<Array<{month: string, ride_count: number, meters: number}>>} ascending by
+ *   month. Months with no counted rides are ABSENT, not zero -- the caller knows which months it
+ *   asked about and a gap is the signal.
+ */
+export async function activityMonthlyTotals(db, config, { athleteId = null } = {}) {
+  const counted = countedPredicate(config, ALL_DATES);
+  const params = [...counted.params];
+  let scope = '';
+  if (athleteId !== null && athleteId !== undefined) {
+    scope = ' AND ac.athlete_id = ?';
+    params.push(requireInt(athleteId, 'athleteId', athleteId));
+  }
+
+  const rows = await db.all(
+    `SELECT substr(ac.local_date, 1, 7)               AS month,
+            COUNT(*)                                  AS ride_count,
+            COALESCE(SUM(ac.distance_meters), 0)      AS meters
+       FROM activities ac
+      WHERE ${counted.sql}${scope}
+      GROUP BY substr(ac.local_date, 1, 7)
+      ORDER BY month ASC`,
+    params,
+  );
+
+  // Numbers coerced here rather than at every call site: the two drivers do not agree on what a
+  // SUM comes back as (node:sqlite can hand back a BigInt), and a BigInt reaching JSON.stringify
+  // throws "Do not know how to serialize a BigInt" from inside the response writer.
+  return rows.map((row) => ({
+    month: String(row.month),
+    ride_count: Number(row.ride_count),
+    meters: Number(row.meters),
+  }));
+}

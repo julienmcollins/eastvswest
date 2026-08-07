@@ -11,6 +11,7 @@ import { saveTokens, loadTokens, deleteTokens, hasTokens } from '../server/db/to
 import {
   upsertActivities, reconcileDeletions, listAthleteActivities, purgeAthleteActivities,
   setManualApproved, getActivity, maxStartEpoch,
+  activityMonthExtent, activityMonthlyTotals,
 } from '../server/db/activities.js';
 import {
   insertSession, findSessionByHash, touchSession, deleteSession,
@@ -416,6 +417,91 @@ test('purgeAthleteActivities really deletes, and maxStartEpoch tracks the waterm
   assert.equal(await maxStartEpoch(db, 1), Math.floor(Date.parse('2026-07-09T08:00:00Z') / 1000));
   assert.equal(await purgeAthleteActivities(db, 1), 2);
   assert.equal(await maxStartEpoch(db, 1), 0);
+  await db.close();
+});
+
+test('activityMonthlyTotals shows the GAP that activityMonthExtent cannot', async () => {
+  // The point of having both. The extent query answers {first, last}, which is all the fetch floor
+  // and the month picker need -- and which reports the SAME answer for a backfill that recovered
+  // every month and one that recovered only the two ends. That is the failure being debugged: a
+  // sync covering January and August while silently missing everything between them.
+  const db = await freshDb();
+  const config = testConfig();
+  await seedAthlete(db, { id: 1, team: 'EAST' });
+
+  await seedActivity(db, { id: 1, athleteId: 1, localDate: '2026-06-05', meters: MILE });
+  await seedActivity(db, { id: 2, athleteId: 1, localDate: '2026-06-20', meters: MILE * 2 });
+  // Nothing at all in July -- the hole.
+  await seedActivity(db, { id: 3, athleteId: 1, localDate: '2026-08-02', meters: MILE * 10 });
+
+  assert.deepEqual(await activityMonthExtent(db, config), { first: '2026-06', last: '2026-08' },
+    'the extent spans the hole without revealing it');
+
+  assert.deepEqual(await activityMonthlyTotals(db, config), [
+    { month: '2026-06', ride_count: 2, meters: MILE * 3 },
+    { month: '2026-08', ride_count: 1, meters: MILE * 10 },
+  ], 'July must be ABSENT, not reported as zero -- the gap is the signal');
+});
+
+test('activityMonthlyTotals counts exactly what the board counts, and scopes by athlete', async () => {
+  // It reuses `countedPredicate`, and that reuse is the whole value: "July has 12 rides" has to
+  // mean "12 rides appear on July's board". A plain COUNT(*) would count Runs, soft-deleted rows
+  // and unapproved manual entries, so a backfill would look successful while the board stayed
+  // empty -- a verification number that disagrees with the thing it verifies is worse than none.
+  const db = await freshDb();
+  const config = testConfig();
+  await seedAthlete(db, { id: 1, team: 'EAST' });
+  await seedAthlete(db, { id: 2, team: 'WEST' });
+
+  await seedActivity(db, { id: 1, athleteId: 1, localDate: '2026-07-05', meters: MILE });
+  await seedActivity(db, { id: 2, athleteId: 1, localDate: '2026-07-06', sportType: 'Run' });
+  await seedActivity(db, { id: 3, athleteId: 1, localDate: '2026-07-07', isManual: true });
+  await seedActivity(db, { id: 4, athleteId: 1, localDate: '2026-07-08', deletedAt: 1780000000 });
+  await seedActivity(db, { id: 5, athleteId: 2, localDate: '2026-07-09', meters: MILE * 5 });
+
+  assert.deepEqual(await activityMonthlyTotals(db, config, { athleteId: 1 }), [
+    { month: '2026-07', ride_count: 1, meters: MILE },
+  ], 'the Run, the unapproved manual ride and the soft-deleted row are all excluded');
+
+  // Admin approval flips a manual ride onto the board, so it must flip here in the same breath.
+  await setManualApproved(db, 3, true);
+  assert.deepEqual(await activityMonthlyTotals(db, config, { athleteId: 1 }), [
+    { month: '2026-07', ride_count: 2, meters: MILE * 2 },
+  ]);
+
+  // Scoped: rider 2's five miles belong to rider 2 and to the unscoped total, nobody else.
+  assert.deepEqual(await activityMonthlyTotals(db, config, { athleteId: 2 }), [
+    { month: '2026-07', ride_count: 1, meters: MILE * 5 },
+  ]);
+  assert.deepEqual(await activityMonthlyTotals(db, config), [
+    { month: '2026-07', ride_count: 3, meters: MILE * 7 },
+  ]);
+
+  // Empty is an empty array, not a row of nulls: `MIN/MAX` over no rows returns one NULL row,
+  // which is why the extent query needs its `?? null` and this one does not.
+  assert.deepEqual(await activityMonthlyTotals(db, config, { athleteId: 404 }), []);
+  await db.close();
+});
+
+test('activityMonthlyTotals keys the month off the LOCAL date, never the UTC instant', async () => {
+  // The Auckland 00:30-local ride. `start_date_local` carries a bogus trailing Z, so parsing it as
+  // an instant shifts the date by the rider's UTC offset -- here it would move a July 1 ride back
+  // into June and credit it to the wrong month's competition.
+  const db = await freshDb();
+  const config = testConfig();
+  await seedAthlete(db, { id: 1, team: 'EAST' });
+  await seedActivity(db, {
+    id: 1,
+    athleteId: 1,
+    localDate: '2026-07-01',
+    localTime: '00:30:00',
+    startDateUtc: '2026-06-30T11:30:00Z',
+    meters: MILE,
+  });
+
+  assert.deepEqual(await activityMonthlyTotals(db, config), [
+    { month: '2026-07', ride_count: 1, meters: MILE },
+  ]);
   await db.close();
 });
 

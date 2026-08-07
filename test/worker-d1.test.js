@@ -6,7 +6,7 @@ import { handleWithNodeApi } from '../server/worker.js';
 import { buildApp } from '../server/app.js';
 import { buildRoutes } from '../server/routes/index.js';
 import { createStravaClient } from '../server/strava/client.js';
-import { seedAthlete, seedActivity, testConfig, SENTINEL_SECRET } from './helpers/testDb.js';
+import { seedAthlete, seedActivity, seedSession, testConfig, SENTINEL_SECRET } from './helpers/testDb.js';
 import { createFakeStrava } from './helpers/fakeStrava.js';
 import { freshD1, createFakeD1 } from './helpers/fakeD1.js';
 
@@ -206,6 +206,43 @@ test('worker: the leaderboard renders real rows read through D1', async () => {
   assert.equal(Math.round(west.miles), 20);
   assert.equal(Math.round(east.miles), 10);
   assert.equal(east.ride_count, 1);
+});
+
+test('worker: the per-month backfill table groups correctly over D1', async () => {
+  // `activityMonthlyTotals` is the only query in the tree that GROUPs BY a `substr` expression, and
+  // it is the one an operator reads to decide whether a backfill worked. A driver difference that
+  // returned its counts as strings, or lost the ORDER BY, would be invisible on the Node path and
+  // wrong in production -- where this endpoint is the only view of the data anyone has.
+  const { sqlite, call } = await workerHarness({ ADMIN_BOOTSTRAP_ATHLETE_IDS: '1' });
+  await seedAthlete(sqlite, { id: 1, name: 'East One', team: 'EAST', isAdmin: true });
+  await seedActivity(sqlite, { athleteId: 1, id: 100, localDate: '2026-06-10', meters: 16093.44 });
+  await seedActivity(sqlite, { athleteId: 1, id: 101, localDate: '2026-06-11', meters: 16093.44 });
+  // Nothing in July: the gap has to survive the adapter, because the gap is the finding.
+  await seedActivity(sqlite, { athleteId: 1, id: 200, localDate: '2026-08-11', meters: 32186.88 });
+  await seedActivity(sqlite, { athleteId: 1, id: 201, localDate: '2026-08-12', sportType: 'Run' });
+
+  const token = 'd1-admin-token';
+  // The TTL has to cover the gap between the real clock (which stamps the row) and NOW_MS (which
+  // the app reads it with). A default hour would leave the session already expired and the 401
+  // would look like a broken admin guard.
+  await seedSession(sqlite, 1, token, { ttlSeconds: 400 * 86400 });
+
+  const res = await call('https://api.test/api/admin/months', {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+
+  assert.equal(body.current_month, '2026-08');
+  assert.equal(body.competition_first_month, '2026-06');
+  assert.deepEqual(body.months, [
+    { month: '2026-06', ride_count: 2, meters: 32186.88 },
+    { month: '2026-08', ride_count: 1, meters: 32186.88 },
+  ]);
+  // Numbers, not strings: a stringified count reaching the script's arithmetic would silently
+  // concatenate rather than add when the per-athlete tables are merged.
+  assert.equal(typeof body.months[0].ride_count, 'number');
+  assert.equal(typeof body.months[0].meters, 'number');
 });
 
 test('worker: unknown /api paths are JSON 404s, and unknown non-api paths too', async () => {

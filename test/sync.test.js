@@ -177,6 +177,96 @@ test('the widened window reconciles the months it now actually fetched', async (
   assert.equal(ancient.deleted_at, null, 'a row outside the fetch window must never be reconciled away');
 });
 
+// ------------------------------------------------------- sinceMonth: the explicit floor
+
+test('sinceMonth reaches months NOTHING is stored for, which is the only way to recover them', async () => {
+  // THE REPORTED BUG: "running backfill still doesn't get me the correct data for months prior to
+  // September and August". Re-running the backfill could not possibly have helped, and this test
+  // says why in two halves.
+  //
+  // The fetch floor is the earliest of {configured first month, current month, first month that
+  // HOLDS rides}. That third source is derived from the rows the fetch itself writes, so it is
+  // circular: it can only widen to a month that already has data. With COMPETITION_START in the
+  // future and an EMPTY table, all three sources agree on the current month, so every run computes
+  // the identical window and recovers nothing -- forever, with no error and an `ok` status.
+  const configOverrides = { COMPETITION_START: '2026-12-01', COMPETITION_END: '2026-12-31' };
+
+  // Half one: the stuck state. NOW is 2026-09-02, so the floor is September 1 and every June and
+  // July ride is outside the window. A full sync succeeds and stores none of them. (August 31 does
+  // land: the window is padded a day on each end, which is a full month short of recovering July.)
+  const stuck = await setup({ configOverrides });
+  const before = await sync(stuck, { mode: 'full' });
+  assert.equal(before.ok, true, 'the stuck sync reports success, which is what made this invisible');
+  assert.equal(await countRows(stuck.db, `local_date < '2026-08-01'`), 0, 'precondition: nothing before August');
+  assert.equal(await countRows(stuck.db, `local_date LIKE '2026-07-%'`), 0, 'precondition: no July rides');
+
+  // Half two: naming the month. Same config, same empty table, one extra argument.
+  const ctx = await setup({ configOverrides });
+  const res = await sync(ctx, { mode: 'full', sinceMonth: '2026-06' });
+
+  assert.equal(res.truncated, false);
+  assert.equal(res.activitiesScanned, EXPECTED.total_records, 'the whole fixture is inside the window now');
+
+  const pages = ctx.fake.requests.filter((r) => r.pathname.endsWith('/athlete/activities'));
+  assert.ok(pages.length > 0, 'no activity page was requested at all');
+  const juneFirst = Math.floor(Date.parse('2026-06-01T00:00:00Z') / 1000);
+  for (const page of pages) {
+    assert.ok(
+      Number(page.query.after) <= juneFirst,
+      `asked Strava for after=${new Date(Number(page.query.after) * 1000).toISOString()}, which misses June`,
+    );
+    // Every page must carry the SAME bounds. Paging with a moving window silently skips records,
+    // because page N means different rides once the filter changes underneath it.
+    assert.equal(page.query.after, pages[0].query.after);
+    assert.equal(page.query.before, pages[0].query.before);
+  }
+
+  // EVERY month landed, not just the endpoints. Recovering June and August while silently missing
+  // July is the exact failure `activityMonthlyTotals` was added to expose, so it is asserted here
+  // rather than left to a spot check of the earliest month.
+  for (const [month, expected] of Object.entries(EXPECTED.by_month)) {
+    assert.equal(
+      await countRows(ctx.db, `local_date LIKE '${month}-%' AND deleted_at IS NULL`),
+      ACTIVITY_FIXTURE.activities.filter((a) => String(a.start_date_local).startsWith(month)).length,
+      `${month} did not land in full (expected ${expected.records} countable)`,
+    );
+  }
+});
+
+test('a narrow sinceMonth cannot reconcile away the months it did not fetch', async () => {
+  // Narrowing is supported -- it is the chunking escape hatch for a history that truncates -- and
+  // this is the property that makes it safe to support. The fetch window and the reconcile range
+  // are derived from the one `window` object, so `reconcile ⊆ fetch` holds by construction. If it
+  // did not, `--since 2026-08` would soft-delete every June and July ride as "no longer reported
+  // by Strava" and quietly zero half the season.
+  const ctx = await setup();
+
+  // Everything first, so there are real June and July rows to endanger.
+  await sync(ctx, { mode: 'full', sinceMonth: '2026-06' });
+  const julyBefore = await countRows(ctx.db, `local_date LIKE '2026-07-%' AND deleted_at IS NULL`);
+  const juneBefore = await countRows(ctx.db, `local_date LIKE '2026-06-%' AND deleted_at IS NULL`);
+  assert.ok(julyBefore > 0 && juneBefore > 0, 'precondition: June and July are stored');
+
+  // Now a deliberately narrow re-sync. `force` skips the cooldown; the fixture is unchanged, so a
+  // correct run has nothing to delete anywhere.
+  await sync(ctx, { mode: 'full', force: true, sinceMonth: '2026-09' });
+
+  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-07-%' AND deleted_at IS NULL`), julyBefore);
+  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-06-%' AND deleted_at IS NULL`), juneBefore);
+});
+
+test('a malformed sinceMonth fails the sync instead of silently using the default floor', async () => {
+  // It arrives from a command line and from an admin request body. Falling back to the union would
+  // run the backfill over exactly the range that was already broken and report success, so the
+  // operator would conclude the rides are genuinely gone upstream.
+  const ctx = await setup();
+  await assert.rejects(() => sync(ctx, { mode: 'full', sinceMonth: '2026-13' }), /sinceMonth/);
+
+  // And the lock is not left behind by the throw -- the `finally` in syncAthlete owns that.
+  const state = await getSyncState(ctx.db, ATHLETE_ID);
+  assert.equal(state?.lock_expires_at ?? null, null, 'a rejected sync must not leave the athlete locked');
+});
+
 // ------------------------------------------------------- the whole fixture, end to end
 
 test('a full sync stores EVERY record, counts only the countable ones, and totals 224.0 mi', async () => {
