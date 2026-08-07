@@ -141,17 +141,21 @@ export const MAX_PICKER_MONTHS = 120;
  *
  * Not the same number as `MAX_PICKER_MONTHS`, and deliberately much smaller. The picker's cap
  * bounds how many `<option>` elements a browser builds, which is cheap; this one bounds the only
- * decision in the app that spends Strava rate limit, which is not. `computeSyncWindow` now widens
- * its floor using the extent of STORED ride data, and that extent is derived from `local_date`
- * values -- so a single row with a corrupt `start_date_local` (a year of `1026`) would otherwise
- * make every sync, for every rider, forever, ask Strava for a millennium of pages.
+ * decision in the app that spends Strava rate limit, which is not. Sync asks for one month at a
+ * time (`computeSyncMonths`), so this is now a cap on the REQUEST COUNT of a full sync, not merely
+ * on the span of one range -- which makes it more load-bearing than before, not less. The month
+ * list is widened by the extent of STORED ride data, and that extent is derived from `local_date`
+ * values, so a single row with a corrupt `start_date_local` (a year of `1026`) would otherwise make
+ * every sync, for every rider, forever, ask Strava for a millennium of months.
  *
  * The OLDEST months are dropped first, for the same reason `monthBounds` trims that way: the
  * current month is the only one that can still be ridden, so it must never be the one trimmed out.
  *
- * 24 months at a prolific ~40 rides/month is ~5 pages at `per_page=200` -- comfortably inside
- * `STRAVA_MAX_PAGES`, which is what keeps a widened window from coming back `truncated` and
- * therefore suppressing reconciliation on every run.
+ * 24 is chosen against Strava's 100-requests-per-15-minutes read limit: one worst-case full sync is
+ * 24 requests, so three riders can be fully re-synced back to back inside one window. In ordinary
+ * operation a full sync is one request per configured month and `FULL_SYNC_INTERVAL_SECONDS` limits
+ * it to once a day per rider, while every Refresh in between is `mode:'incremental'` -- normally a
+ * single request for the current month.
  */
 export const SYNC_MAX_MONTHS = 24;
 
@@ -168,15 +172,3 @@ export const COMPETITION_STATES = Object.freeze({
   OPEN: 'open',
   CLOSED: 'closed',
 });
-
-/**
- * The `mode` a sync request may ask for. Here rather than beside one route because TWO routes
- * accept it now -- `POST /api/me/sync` and the admin backfill -- and a second private copy of
- * the set is how the two drift into disagreeing about what a valid mode is.
- *
- * Note this is the WIRE enum, not the internal one: `syncAthlete` additionally accepts `null`
- * for "auto", which no caller may request explicitly. Auto exists so an ordinary Refresh gets a
- * cheap incremental most of the time and a full rescan daily; a client that could name it would
- * be asking the server to decide something it has already decided.
- */
-export const SYNC_MODES = Object.freeze(['incremental', 'full']);

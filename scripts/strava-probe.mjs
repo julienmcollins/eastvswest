@@ -313,7 +313,7 @@ async function main() {
       results.answers.beforeAfterProbeRideId = probeRide.id;
       results.answers.beforeAfterOffsetSeconds = offsetSeconds;
       say('\nSEMANTICS:', results.answers.beforeAfterSemantics);
-      say('Either answer is safe for this app: computeSyncWindow pads +/-86400 s, and no');
+      say('Either answer is safe for this app: computeSyncMonths pads +/-86400 s, and no');
       say('UTC offset exceeds 14 h. This is recorded, not depended on.');
     }
 

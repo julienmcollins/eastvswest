@@ -1,5 +1,5 @@
 import { SYNC_MAX_MONTHS, SYNC_WINDOW_PAD_SECONDS } from '../contracts.js';
-import { addMonths, epochAtStartOfDate, epochAtEndOfDate, isCalendarMonth, startOfMonth, endOfMonth, monthOf, todayInTz } from '../lib/dates.js';
+import { addMonths, epochAtStartOfDate, isCalendarMonth, startOfMonth, monthOf, todayInTz } from '../lib/dates.js';
 
 /**
  * Pure translation layer between Strava's JSON and this app's own shapes.
@@ -227,162 +227,139 @@ export function maxStartEpoch(activities, seed = 0) {
 }
 
 /**
- * The [after, before] window to ask Strava for, in unix seconds.
+ * ONE FETCH WINDOW PER MONTH, oldest first. Every month is asked for by name.
  *
- * ONE fetch range covers EVERY month worth fetching. It is deliberately not per-month: sync
- * stores everything and the leaderboard filters at query time (sync.js rule 1), so a
- * per-month fetch would multiply requests against a rate-limited API to produce data we
- * already have.
+ * This used to be a single `[after, before]` spanning every month at once, with a floor that was
+ * the earliest of {`competitionFirstMonth`, the current month, the earliest month already holding
+ * rides}. That shape had one fatal property: the third source is derived from the rows the fetch
+ * itself writes, so it could only ever widen the floor to a month that ALREADY had data. With
+ * COMPETITION_START in the future -- which is what shipped -- the floor collapsed onto the first
+ * of the CURRENT month, and a month that had been missed once was unreachable by every source
+ * forever. Re-syncing computed the identical window and recovered nothing.
  *
- * THE FLOOR IS A UNION OF THREE SOURCES -- unless `sinceMonth` names one outright, see below --
- * and it must stay a superset of what the month picker offers. Each source is a month a reader
- * can legitimately end up looking at:
+ * Asking per month removes the whole class of problem instead of patching the floor:
  *
- *   1. the first day of `competitionFirstMonth` -- a superset of `COMPETITION_START` whenever
- *      that date falls mid-month, and the widening is required: a START of 2026-06-15 makes all
- *      of June selectable, so June 1-14 must be fetchable or that month's board is silently short;
- *   2. the CURRENT month, because leaving it out is a silent, total failure. With
- *      COMPETITION_START/END set to a month that has not begun (September, say, configured in
- *      August) the configured range is entirely in the future, `after` gets clamped to now by the
- *      rule below, and every sync then asks Strava for "rides between now and tomorrow" --
- *      succeeding, reporting `ok`, and storing NOTHING, for weeks;
- *   3. the earliest month that already HOLDS ride data (`dataMonths`, queried by the caller).
+ *   - A month is either in the list or it is not. There is no arithmetic that can quietly
+ *     exclude the middle of a range, and no need for a separate recovery tool -- an ordinary
+ *     full sync fetches every month, every time.
+ *   - Truncation stops being a dead end. `STRAVA_MAX_PAGES` x `STRAVA_PAGE_SIZE` is 8000 rides;
+ *     one calendar month cannot approach it, so a truncated fetch is no longer a state a re-run
+ *     reproduces identically.
+ *   - Reconciliation gets tighter. The caller reconciles each month against that month's own
+ *     fetch, so one month coming back short can no longer suppress -- or wrongly authorize --
+ *     deletions in another.
  *
- * Source 3 is the fix for a reported bug, and the reason is worth keeping: the range used to be
- * sources 1 and 2 only, which for a future one-month `.env` (START=2026-09-01 viewed in August)
- * collapses the floor onto the first of the CURRENT month, every month, forever. July's board
- * then holds only whatever happened to be fetched while July was current -- and since
- * /athlete/activities has no `modified_after`, the full rescan that exists to catch late uploads,
- * edits and privacy flips is the only thing that could find the rest, and it never reached July.
- * A rider who connected in August had no July history at all.
+ * WHAT IT COSTS, stated rather than buried: a full sync is now one request per month instead of
+ * one or two in total. Roughly 9 for a Jan-September season, per rider. Strava's read limit is
+ * 100 per 15 minutes and 1000 per day, so a ten-rider roster is ~90 requests for a full pass --
+ * inside the quota, but no longer negligible. Two existing mechanisms keep that safe and neither
+ * is incidental: `FULL_SYNC_INTERVAL_SECONDS` means auto mode picks 'full' only once a day per
+ * rider, and `mode:'incremental'` below asks only for the months since the watermark, which is
+ * normally the current month alone.
  *
- * That made the FETCH floor narrower than the BROWSE floor: `monthBounds` in
- * server/lib/dates.js already unions stored data into what a reader may select, so the picker
- * offered July while sync skipped it. Feeding both from the same `activityMonthExtent` query
- * makes "the picker offers this month" and "sync fetches this month" one predicate instead of
- * two that can drift.
+ * The month list is still the union of the same three sources -- config, the clock, and stored
+ * data -- because each is a month a reader can legitimately select, and "the picker offers this
+ * month" must imply "sync rescans this month" or a ride deleted at Strava in an old month can
+ * never be reconciled away. Bounded by SYNC_MAX_MONTHS, and the trim is reported rather than
+ * applied silently.
  *
- * Still BOUNDED, not "all of history": this is the one decision in the app that spends Strava
- * rate limit, and source 3 is derived from stored data, so it is clamped to SYNC_MAX_MONTHS
- * back from the current month and the clamp is reported rather than applied silently. The clamp
- * applies to `sinceMonth` too -- `--since 1990-01` is a typo, not a request.
+ * Each month's window is padded by SYNC_WINDOW_PAD_SECONDS (86400) on BOTH ends. The
+ * justification is that it is correct under BOTH possible readings of `before`/`after` --
+ * whether Strava compares `start_date` (UTC) or `start_date_local` -- because no UTC offset
+ * exceeds 14 hours, which is less than 24. It is explicitly NOT justified by the unverified
+ * claim that Strava filters on UTC; if that claim turns out to be false, these windows are still
+ * right. The pad makes adjacent months overlap by two days, so a boundary ride is fetched twice;
+ * the caller dedupes on activity id, and the upsert is idempotent anyway.
  *
- * Padded by SYNC_WINDOW_PAD_SECONDS (86400) on BOTH ends. The justification is that it
- * is correct under BOTH possible readings of `before`/`after` -- whether Strava compares
- * `start_date` (UTC) or `start_date_local` -- because no UTC offset exceeds 14 hours,
- * which is less than 24. It is explicitly NOT justified by the unverified claim that
- * Strava filters on UTC; if that claim turns out to be false, this window is still right.
- *
- * `mode:'incremental'` starts from the watermark; `mode:'full'` ignores it and rescans
- * the whole range, because a watermark alone is provably wrong here: a trip uploaded a
- * week late, a Garmin backfill, or a ride flipped from "Only You" to "Everyone" all have
- * a start_date older than the watermark, and /athlete/activities has no `modified_after`
- * to find them with.
- *
- * `sinceMonth` REPLACES the union outright, and that is the one escape hatch from the
- * circularity above: source 3 can only ever widen the floor to a month that ALREADY holds
- * rides, so a month that was never fetched in the first place is unreachable by every source
- * here -- re-running a backfill computes the identical window and recovers nothing. An
- * operator has to be able to name the month. It is deliberately unconditional in BOTH
- * directions rather than joining the `min`: widening is what recovers a skipped July, and
- * narrowing is what lets a rider whose history exceeds STRAVA_MAX_PAGES be backfilled in
- * chunks. Narrowing is safe because `reconcileDeletions`' range is derived from this same
- * window (server/strava/sync.js), so a narrow fetch can only ever reconcile the months it
- * actually fetched -- it cannot soft-delete a month it did not ask Strava about.
- *
- * NOTHING ON THE REQUEST PATH MAY SET IT. `POST /api/me/sync` deliberately does not forward
- * the rider's on-screen month here; a caller who picks their own fetch window picks their own
- * reconcile window with it. It is set by the admin backfill route and by nothing else.
+ * `mode:'incremental'` asks only for the months from the watermark onward; `mode:'full'` ignores
+ * the watermark and rescans every month, because a watermark alone is provably wrong here: a trip
+ * uploaded a week late, a Garmin backfill, or a ride flipped from "Only You" to "Everyone" all
+ * have a start_date older than the watermark, and /athlete/activities has no `modified_after` to
+ * find them with.
  *
  * @param {{first: string|null, last: string|null}|null} [opts.dataMonths] extent of STORED ride
  *   data, from `activityMonthExtent` in server/db/activities.js. Passed in rather than read here
  *   because this module must stay database-free; `monthBounds` takes it the same way and for the
- *   same reason. Omitting it degrades to the config-plus-clock floor, which is the bug described
- *   above -- every request-serving caller must supply it.
- * @param {string|null} [opts.sinceMonth] `YYYY-MM`. An explicit floor that overrides the union.
- * @returns {{afterEpoch:number, beforeEpoch:number, trimmedFrom:object|null, firstMonth:string}}
- *   `trimmedFrom` is non-null only when SYNC_MAX_MONTHS clipped the floor, so the caller can log
- *   it. A silently capped window reads as "we fetched everything" when it did not. `firstMonth` is
- *   the floor ACTUALLY used, after every clamp -- so an operator reads what was fetched rather than
- *   what was asked for. The two differ whenever a `sinceMonth` was clamped to the current month or
- *   trimmed by the cap, and printing the request instead of the result is how a tool ends up
- *   claiming to have covered a month it never asked about.
+ *   same reason.
+ * @returns {{months: Array<{month:string, afterEpoch:number, beforeEpoch:number,
+ *   startEpoch:number, endEpoch:number}>, trimmedFrom:object|null}}
+ *   `afterEpoch`/`beforeEpoch` are the padded bounds to send Strava. `startEpoch`/`endEpoch` are
+ *   the UNPADDED half-open month in UTC, which is what a caller may reconcile over -- always
+ *   strictly inside the padded window, so `reconcile ⊆ fetch` holds by construction rather than
+ *   by review. `trimmedFrom` is non-null only when SYNC_MAX_MONTHS clipped the list.
  */
-export function computeSyncWindow(config, { mode = 'full', watermarkEpoch = 0, nowMs = Date.now(), dataMonths = null, sinceMonth = null } = {}) {
+export function computeSyncMonths(config, { mode = 'full', watermarkEpoch = 0, nowMs = Date.now(), dataMonths = null } = {}) {
   if (mode !== 'full' && mode !== 'incremental') {
-    throw new StravaMapError(`computeSyncWindow: mode must be 'full' or 'incremental', got ${JSON.stringify(mode)}.`);
+    throw new StravaMapError(`computeSyncMonths: mode must be 'full' or 'incremental', got ${JSON.stringify(mode)}.`);
   }
-  if (!Number.isFinite(nowMs)) throw new StravaMapError(`computeSyncWindow: nowMs must be finite, got ${nowMs}.`);
-  // Thrown, never quietly ignored -- unlike `dataMonths.first`, which is derived from stored data
-  // and so is tolerated when corrupt. This one is a human typing a month on a command line, and
-  // silently falling back to the union would run a backfill that reports success while covering
-  // exactly the range that was already broken.
-  if (sinceMonth !== null && sinceMonth !== undefined && !isCalendarMonth(sinceMonth)) {
-    throw new StravaMapError(`computeSyncWindow: sinceMonth must be a YYYY-MM calendar month, got ${JSON.stringify(sinceMonth)}.`);
-  }
+  if (!Number.isFinite(nowMs)) throw new StravaMapError(`computeSyncMonths: nowMs must be finite, got ${nowMs}.`);
 
+  const nowSeconds = Math.floor(nowMs / 1000);
   const currentMonth = monthOf(todayInTz(config.competitionTz, nowMs));
 
-  // The floor is the EARLIEST of the three, so the fetch range is a superset of every month the
-  // picker offers. Plain `<` on `YYYY-MM` is a correct chronological compare (fixed-width and
-  // zero-padded), which is why no Date is built to order them -- same property the whole month
-  // layer relies on. `isCalendarMonth` guards each candidate because `dataMonths.first` comes
-  // from a `substr` over stored data: one corrupt `start_date_local` must be ignored here, not
-  // honoured as a floor.
+  // Plain `<` on `YYYY-MM` is a correct chronological compare (fixed-width and zero-padded),
+  // which is why no Date is built to order these -- the same property the whole month layer
+  // relies on. `isCalendarMonth` guards each candidate because `dataMonths.first` comes from a
+  // `substr` over stored data: one corrupt `start_date_local` must be ignored here, not honoured.
   const candidates = [config.competitionFirstMonth, currentMonth, dataMonths?.first]
     .filter((m) => isCalendarMonth(m));
-  // `min(sinceMonth, currentMonth)`, NOT sinceMonth alone. The current month is the one month that
-  // is never negotiable -- see source 2 above -- and an override allowed past it walks straight
-  // back into that failure: the default floor is `competitionFirstMonth`, which for a season that
-  // has not begun (September, configured in August) is in the FUTURE, so a plain override would
-  // ask Strava for "rides between now and tomorrow" and report `ok` having stored nothing. That is
-  // the exact bug this parameter was added to fix, reintroduced through the fix. Clamping costs
-  // nothing real either: a floor later than the current month can only select months nobody has
-  // ridden yet, so no reachable ride is lost.
-  let startMonth = isCalendarMonth(sinceMonth)
-    ? (sinceMonth < currentMonth ? sinceMonth : currentMonth)
-    : candidates.reduce((best, m) => (m < best ? m : best), currentMonth);
+  let firstMonth = candidates.reduce((best, m) => (m < best ? m : best), currentMonth);
 
-  // Bounded, and reported. See SYNC_MAX_MONTHS in contracts.js for why the data-derived floor
-  // cannot be trusted unclamped. Trimming the OLDEST months keeps the current month reachable,
-  // which is the one month that can still be ridden.
+  // Bounded, and reported. See SYNC_MAX_MONTHS in contracts.js for why a data-derived floor
+  // cannot be trusted unclamped -- and it now bounds the REQUEST COUNT too, not just the span.
+  // Trimming the oldest keeps the current month, the only one that can still be ridden.
   const floorMonth = addMonths(currentMonth, -(SYNC_MAX_MONTHS - 1));
   let trimmedFrom = null;
-  if (startMonth < floorMonth) {
-    trimmedFrom = { requested_first_month: startMonth, first_month: floorMonth, max_months: SYNC_MAX_MONTHS };
-    startMonth = floorMonth;
+  if (firstMonth < floorMonth) {
+    trimmedFrom = { requested_first_month: firstMonth, first_month: floorMonth, max_months: SYNC_MAX_MONTHS };
+    firstMonth = floorMonth;
   }
 
-  const rangeStart = epochAtStartOfDate(startOfMonth(startMonth));
-  // Not widened by `dataMonths.last`: `upper` below is clamped to `now`, and the current month's
-  // end is always >= now, so a later data month could not move this bound anyway.
-  const rangeEnd = Math.max(
-    epochAtEndOfDate(endOfMonth(config.competitionLastMonth)),
-    epochAtEndOfDate(endOfMonth(currentMonth)),
-  );
-  const nowSeconds = Math.floor(nowMs / 1000);
+  // Never past the current month. Nothing can have been ridden in a month that has not begun, so
+  // asking for one only spends quota -- and `config.competitionLastMonth` is routinely in the
+  // future. This is also why the list can never be empty: `firstMonth` is at most `currentMonth`.
+  const lastMonth = currentMonth;
 
-  // Never ask for the future, and never past the end of the range: rides after it are
-  // outside anything anyone can select, and asking for them only spends rate limit.
-  const upper = Math.min(nowSeconds, rangeEnd);
-
-  let lower = rangeStart;
-  if (mode === 'incremental' && Number.isFinite(watermarkEpoch) && watermarkEpoch > rangeStart) {
-    lower = watermarkEpoch;
+  // Incremental starts at the watermark's month rather than the whole list, which is what keeps an
+  // ordinary Refresh at one request. The watermark's own month is INCLUDED, not skipped: rides
+  // later in that month than the watermark are exactly what an incremental sync is for.
+  let from = firstMonth;
+  if (mode === 'incremental' && Number.isFinite(watermarkEpoch) && watermarkEpoch > 0) {
+    const watermarkMonth = monthOf(new Date(watermarkEpoch * 1000).toISOString());
+    if (isCalendarMonth(watermarkMonth) && watermarkMonth > from) from = watermarkMonth;
+    if (from > lastMonth) from = lastMonth;
   }
 
-  // Clamped to `now` as well as to 0, because `after` is the one bound Strava validates:
-  // a future value is rejected outright with 400 {field:'after', code:'future'}. Before the
-  // first selectable month, RANGE_START - 86400 is still in the future, so an unclamped
-  // `after` makes EVERY sync fail with a 502 instead of succeeding with nothing to show.
-  // `upper` was already clamped to now on the line above; this is the same rule applied to
-  // the lower bound. A future `before` is fine and is the normal case every day of a month.
-  const afterEpoch = Math.max(0, Math.min(lower - SYNC_WINDOW_PAD_SECONDS, nowSeconds));
-  // Math.max keeps the window non-empty before the first month opens, where
-  // min(now, RANGE_END) is below RANGE_START and a naive subtraction would invert the range.
-  const beforeEpoch = Math.max(upper + SYNC_WINDOW_PAD_SECONDS, afterEpoch + 1);
+  const months = [];
+  for (let month = from; month <= lastMonth; month = addMonths(month, 1)) {
+    const startEpoch = epochAtStartOfDate(startOfMonth(month));
+    // Half-open: the first second of the NEXT month. Half-open rather than inclusive because it
+    // is what `reconcileDeletions` binds (`>= start AND < end`), and an inclusive end would need
+    // every caller to remember the -1.
+    const nextStart = epochAtStartOfDate(startOfMonth(addMonths(month, 1)));
 
-  return { afterEpoch, beforeEpoch, trimmedFrom, firstMonth: startMonth };
+    // `after` is the one bound Strava validates: a future value is rejected outright with
+    // 400 {field:'after', code:'future'}, so it is clamped to now. For the current month before
+    // the 2nd, `startEpoch - 86400` is last month -- fine, and covered by the previous entry too.
+    const afterEpoch = Math.max(0, Math.min(startEpoch - SYNC_WINDOW_PAD_SECONDS, nowSeconds));
+    // Never ask beyond now. A future `before` is fine and is the normal case every day of the
+    // current month, but capping the month end at `now` first is what keeps the request honest.
+    const beforeEpoch = Math.max(Math.min(nextStart - 1, nowSeconds) + SYNC_WINDOW_PAD_SECONDS, afterEpoch + 1);
+
+    months.push({
+      month,
+      afterEpoch,
+      beforeEpoch,
+      startEpoch,
+      // Clamped to what was actually ASKED for, never past it. Without this the current month's
+      // reconcile range would run to the 1st of next month while the fetch stopped at
+      // now + 1 day, and a ride dated later in the month than today -- which a rider can create
+      // by uploading with a future date -- would be soft-deleted as "no longer reported".
+      endEpoch: Math.min(nextStart, beforeEpoch),
+    });
+  }
+
+  return { months, trimmedFrom };
 }
 
 /** Case-insensitive header read that works for Headers, a Map, or a plain object. */

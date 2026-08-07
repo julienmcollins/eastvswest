@@ -230,7 +230,7 @@ export function loadConfig(env = process.env, { loadEnvFile = false } = {}) {
    * remove one -- which is the fix for a one-month window hiding the picker entirely.
    *
    * They keep exactly two live jobs, which is why they are not deprecated: they are the fetch
-   * window sync asks Strava for (`computeSyncWindow` in server/strava/map.js -- the one decision
+   * months sync asks Strava for (`computeSyncMonths` in server/strava/map.js -- the one decision
    * here that spends rate limit), and they are the floor that keeps a deliberately configured
    * season browsable before anybody has ridden a metre of it. A START of 2026-06-15 makes the
    * whole of June selectable, not half of it. See docs/SPEC.md "The month picker".

@@ -104,22 +104,6 @@ npm run make-admin -- 12345678
 
 Your athlete ID is the number in your Strava profile URL.
 
-### Recovering months that were never downloaded
-
-`COMPETITION_START` is the floor of the Strava fetch window, and the only other thing that
-widens that floor is the data already stored — so a month that was never fetched cannot be
-reached by re-syncing, however many times you try. If earlier months are empty or short, name
-the month:
-
-```bash
-npm run backfill -- --remote --since 2026-01     # deployed data (Cloudflare D1)
-npm run backfill -- --since 2026-01              # local sqlite, for development
-```
-
-`--remote` needs an admin session token; without it the script writes to the LOCAL database and
-cannot affect a deployment. It prints a per-month ride count so you can see which months
-actually landed. Full walkthrough in [docs/DEPLOY.md](docs/DEPLOY.md) step 4.
-
 ### Optional: resolve the Strava API unknowns
 
 This project was built without network access to Strava's documentation, so a handful of API

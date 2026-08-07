@@ -13,7 +13,7 @@ import {
   releaseLock,
   sweepStaleLocks,
 } from '../db/syncState.js';
-import { computeSyncWindow, isCountedSportType, localDateOf, normalizeActivity } from './map.js';
+import { computeSyncMonths, isCountedSportType, localDateOf, normalizeActivity } from './map.js';
 import { StravaRateLimitError } from './client.js';
 import { assertScope } from './authUrl.js';
 import { withAuth } from './tokenService.js';
@@ -38,13 +38,18 @@ import { withAuth } from './tokenService.js';
  *     flipping a three-week-old ride from "Only You" to "Everyone", a corrected distance --
  *     every one of these carries a `start_date` OLDER than the watermark, and
  *     /athlete/activities has no `modified_after` to find them with. They would be missed
- *     forever. A full rescan of a 90-day season is 2-4 requests.
+ *     forever.
  *
- *  3. RECONCILIATION IS STRICTLY GATED on `mode === 'full' && no error && !truncated`. Run
- *     against a partial fetch it soft-deletes every ride the missing pages did not return,
- *     i.e. it silently zeroes a rider in the middle of the competition on a transient
- *     upstream 500. The same gate gates the watermark and `last_full_sync_at`: recording
- *     progress we did not make is how a gap becomes permanent.
+ *  3. EVERY MONTH IS FETCHED BY NAME, one request each, oldest first (`computeSyncMonths`).
+ *     Not one wide range: a single range needs a FLOOR, the floor was partly derived from the
+ *     rows the fetch itself wrote, and a month that had been missed once was therefore
+ *     unreachable forever -- re-syncing recomputed the identical range and recovered nothing.
+ *     Asking per month means a month is either in the list or it is not, with no arithmetic in
+ *     between. RECONCILIATION IS PER MONTH TOO, gated on that month's own fetch being complete
+ *     and untruncated with every record understood, so one month coming back short can neither
+ *     suppress nor wrongly authorize deletions in another. A month never reached is never
+ *     reconciled. The same gate still gates `last_full_sync_at`: recording progress we did not
+ *     make is how a gap becomes permanent.
  *
  *  4. NEVER SLEEP. A rate limit surfaces as a 429 carrying a time, because a handler that
  *     sleeps out a 15-minute Strava block is an outage, and one that retries inside the block
@@ -179,20 +184,14 @@ async function restorePreviousOutcome(db, athleteId, previous) {
  * @param {object} config frozen config (server/config.js)
  * @param {object} strava client (server/strava/client.js)
  * @param {number} athleteId
- * @param {{mode?: 'full'|'incremental'|null, force?: boolean, nowMs?: number,
- *   sinceMonth?: string|null}} [opts]
+ * @param {{mode?: 'full'|'incremental'|null, force?: boolean, nowMs?: number}} [opts]
  *   `mode` null means auto: 'full' when `last_full_sync_at` is missing or older than a day.
  *   `force` skips the cooldown only -- never the lock, which exists to stop concurrent runs.
- *   `sinceMonth` (`YYYY-MM`) overrides the fetch floor outright; see `computeSyncWindow`. It is
- *   the ONLY way to reach a month that holds no rides yet, and therefore the only way to
- *   recover one that an earlier narrow window skipped. Admin-only -- `POST /api/me/sync` must
- *   never forward a rider's on-screen month here, because the fetch window is also the
- *   reconcile window.
- * @returns {Promise<{ok:true, mode:string, syncedAt:string, firstMonth:string,
- *   activitiesScanned:number, activitiesCounted:number, activitiesAdded:number,
- *   activitiesRemoved:number, pagesFetched:number, truncated:boolean}>}
+ * @returns {Promise<{ok:true, mode:string, syncedAt:string, activitiesScanned:number,
+ *   activitiesCounted:number, activitiesAdded:number, activitiesRemoved:number,
+ *   pagesFetched:number, truncated:boolean}>}
  */
-export async function syncAthlete(db, config, strava, athleteId, { mode = null, force = false, nowMs = Date.now(), sinceMonth = null } = {}) {
+export async function syncAthlete(db, config, strava, athleteId, { mode = null, force = false, nowMs = Date.now() } = {}) {
   const id = Number(athleteId);
   if (!Number.isInteger(id) || id <= 0) {
     throw new TypeError(`syncAthlete: athleteId must be a positive integer, got ${JSON.stringify(athleteId)}.`);
@@ -258,7 +257,7 @@ export async function syncAthlete(db, config, strava, athleteId, { mode = null, 
         : 'incremental');
 
     try {
-      const result = await runSync(db, config, strava, id, { mode: resolvedMode, nowMs, nowEpoch, syncedAt, state, sinceMonth });
+      const result = await runSync(db, config, strava, id, { mode: resolvedMode, nowMs, nowEpoch, syncedAt, state });
 
       await recordOk(db, id, {
         nowEpoch,
@@ -289,7 +288,7 @@ export async function syncAthlete(db, config, strava, athleteId, { mode = null, 
  * Split out so the lock/cooldown/bookkeeping shell above reads as a single sequence and this
  * function can be read as "what we do to the data".
  */
-async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, syncedAt, state, sinceMonth = null }) {
+async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, syncedAt, state }) {
   // ---- identity refresh. Its own withAuth call, so a 401 here retries ONE request rather
   // than re-fetching every activity page.
   const athleteRaw = await withAuth(db, config, strava, athleteId, (token) => strava.getAthlete(token), { nowMs });
@@ -298,86 +297,137 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
   // is_admin, granted_scope and the revoked flags alone.
   await upsertAthleteFromStrava(db, athleteRaw, { nowIso: syncedAt });
 
-  // The fetch floor is widened by the extent of what we ALREADY hold, not just by config and the
-  // clock -- see computeSyncWindow. This is the query that makes the fetch range a superset of the
-  // month picker's range: `activityMonthExtent` is the same function `selectableMonthBounds` feeds
-  // to `monthBounds`, so a month a reader can select is a month this sync rescans. Reading it here
-  // rather than in map.js is the usual split: map.js has no database, and sync.js is the one module
-  // that may see both.
-  //
-  // `sinceMonth` overrides all of that when an admin names a month, which is what makes a backfill
-  // able to reach a month holding nothing yet -- the one case the extent query provably cannot,
-  // since it is derived from the very rows the fetch would have written.
-  const window = computeSyncWindow(config, {
+  // One entry per month, oldest first -- see computeSyncMonths. `activityMonthExtent` widens the
+  // list to cover any month that already HOLDS rides, which is what keeps "the picker offers this
+  // month" and "sync rescans this month" one predicate instead of two that can drift: it is the
+  // same query `selectableMonthBounds` feeds to `monthBounds`. Reading it here rather than in
+  // map.js is the usual split -- map.js has no database, and sync.js is the one module that may
+  // see both.
+  const plan = computeSyncMonths(config, {
     mode,
     watermarkEpoch: Number(state?.watermark_epoch ?? 0),
     nowMs,
     dataMonths: await activityMonthExtent(db, config),
-    sinceMonth,
   });
 
-  // Logged, never silent: a window clipped by SYNC_MAX_MONTHS still reports `ok` and still
-  // reconciles, so without this line a rider whose history exceeds the cap looks fully synced.
-  if (window.trimmedFrom) {
-    log.warn('sync window trimmed to SYNC_MAX_MONTHS', { athlete_id: athleteId, mode, since_month: sinceMonth, ...window.trimmedFrom });
+  // Logged, never silent: a list clipped by SYNC_MAX_MONTHS still reports `ok`, so without this
+  // line a rider whose history exceeds the cap looks fully synced.
+  if (plan.trimmedFrom) {
+    log.warn('sync month list trimmed to SYNC_MAX_MONTHS', { athlete_id: athleteId, mode, ...plan.trimmedFrom });
   }
 
-  // ---- fetch. A failure mid-pagination is NOT fatal: the pages already in hand are worth
-  // persisting (the upsert is idempotent), and the error's non-enumerable `partial` is how
-  // the client hands them over without putting 200 rides into a log line.
-  let fetched = { activities: [], pages: 0, truncated: true };
+  /**
+   * ---- fetch, ONE MONTH AT A TIME.
+   *
+   * `byId` rather than an array because adjacent months overlap by the ±86400 s pad, so a ride
+   * near a boundary comes back in two months' fetches. Keyed on activity id, the same key the
+   * upsert conflicts on.
+   *
+   * A failure is NOT fatal: whatever was fetched is worth persisting (the upsert is idempotent),
+   * and the error's non-enumerable `partial` is how the client hands over the pages already in
+   * hand without putting 200 rides into a log line. But it DOES stop the loop -- every remaining
+   * month would hit the same rate limit or the same upstream outage, so continuing turns one error
+   * into one per month. Months never reached are simply absent from `results`, and therefore never
+   * reconciled.
+   */
+  const byId = new Map();
+  const results = [];
   let fetchError = null;
-  try {
-    fetched = await withAuth(
-      db,
-      config,
-      strava,
-      athleteId,
-      (token) => strava.fetchAllActivities({ accessToken: token, after: window.afterEpoch, before: window.beforeEpoch }),
-      { nowMs },
-    );
-  } catch (err) {
-    fetchError = err;
-    if (err?.partial) {
-      fetched = { activities: err.partial.activities, pages: err.partial.pages, truncated: true };
-    }
-    log.warn('activity fetch failed; persisting the pages already fetched', {
-      athlete_id: athleteId,
-      mode,
-      pages_fetched: fetched.pages,
-      activities_in_hand: fetched.activities.length,
-      error_name: err?.name,
-      error_message: err?.message,
-    });
-  }
+  let pagesFetched = 0;
+  /**
+   * DISTINCT ids, not a running total of `activities.length`.
+   *
+   * The ±86400 s pad makes adjacent months overlap by two days, so a boundary ride is genuinely
+   * returned twice. Summing the raw lengths would report 217 scanned for a 216-ride history and
+   * make the number drift further the more months are synced -- a diagnostic that inflates with
+   * the size of the fetch is worse than none. Unkeyable records are counted individually because
+   * there is nothing to dedupe them on; `normalizeActivity` rejects them a few lines below anyway.
+   */
+  const scannedIds = new Set();
+  let unkeyableScanned = 0;
 
-  // ---- normalize EVERYTHING. No sport filter, no window filter: see rule 1 at the top.
-  const rows = [];
-  const seenIds = [];
-  let watermarkEpoch = 0;
-  let malformed = 0;
-
-  for (const raw of fetched.activities) {
-    let row;
+  for (const win of plan.months) {
+    let fetched = { activities: [], pages: 0, truncated: true };
+    let monthError = null;
     try {
-      row = normalizeActivity(raw, { athleteId });
+      fetched = await withAuth(
+        db,
+        config,
+        strava,
+        athleteId,
+        (token) => strava.fetchAllActivities({ accessToken: token, after: win.afterEpoch, before: win.beforeEpoch }),
+        { nowMs },
+      );
     } catch (err) {
-      // One unusable record must not fail the whole sync -- that would block a rider
-      // indefinitely on data we cannot fix. It DOES suppress reconciliation below, because a
-      // record we could not read is a record whose id is missing from `seenIds`, and
-      // reconciliation would read that absence as "the rider deleted it".
-      malformed += 1;
-      log.warn('skipping an unusable Strava activity', {
+      monthError = err;
+      fetchError = err;
+      if (err?.partial) {
+        fetched = { activities: err.partial.activities, pages: err.partial.pages, truncated: true };
+      }
+      log.warn('activity fetch failed; persisting what was already fetched', {
         athlete_id: athleteId,
-        activity_id: raw?.id ?? null,
+        mode,
+        month: win.month,
+        pages_fetched: fetched.pages,
+        activities_in_hand: fetched.activities.length,
+        error_name: err?.name,
         error_message: err?.message,
       });
-      continue;
     }
-    rows.push(row);
-    seenIds.push(row.strava_activity_id);
-    // Max over every page, never a positional element: Strava's ordering flips depending on
-    // whether `after` was sent.
+
+    pagesFetched += fetched.pages;
+
+    // ---- normalize EVERYTHING. No sport filter, no window filter: see rule 1 at the top.
+    const seenIds = [];
+    let malformed = 0;
+    for (const raw of fetched.activities) {
+      const key = raw?.id;
+      if (typeof key === 'number' || typeof key === 'string') scannedIds.add(String(key));
+      else unkeyableScanned += 1;
+
+      let row;
+      try {
+        row = normalizeActivity(raw, { athleteId });
+      } catch (err) {
+        // One unusable record must not fail the whole sync -- that would block a rider
+        // indefinitely on data we cannot fix. It DOES suppress reconciliation for THIS MONTH,
+        // because a record we could not read is a record whose id is missing from `seenIds`, and
+        // reconciliation would read that absence as "the rider deleted it". Scoping that
+        // suppression to one month is a gain from doing this per month: before, a single
+        // unreadable January record blocked August's deletions too.
+        malformed += 1;
+        log.warn('skipping an unusable Strava activity', {
+          athlete_id: athleteId,
+          month: win.month,
+          activity_id: raw?.id ?? null,
+          error_message: err?.message,
+        });
+        continue;
+      }
+      byId.set(row.strava_activity_id, row);
+      seenIds.push(row.strava_activity_id);
+    }
+
+    results.push({
+      ...win,
+      seenIds,
+      /** The page cap was hit for this month -- reported on the wire as `truncated`. */
+      truncated: fetched.truncated === true,
+      /**
+       * The gate, now per month. All three conditions, and nothing else, permit a destructive
+       * write for this month: a complete fetch of it, with every record understood.
+       */
+      complete: monthError === null && fetched.truncated !== true && malformed === 0,
+    });
+
+    if (monthError !== null) break;
+  }
+
+  const rows = [...byId.values()];
+  // Max over every row of every month, never a positional element: Strava's ordering flips
+  // depending on whether `after` was sent.
+  let watermarkEpoch = 0;
+  for (const row of rows) {
     if (row.start_epoch > watermarkEpoch) watermarkEpoch = row.start_epoch;
   }
 
@@ -385,33 +435,46 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
   await upsertActivities(db, athleteId, rows, { syncedAt });
   const activitiesAdded = Math.max(0, (await countStoredActivities(db, athleteId)) - storedBefore);
 
+  /** Every month in the plan was reached. A break above leaves the rest unfetched. */
+  const allMonthsReached = results.length === plan.months.length;
+  /** Every month was reached AND came back reconcilable. Gates `last_full_sync_at`. */
+  const complete = fetchError === null && allMonthsReached && results.every((r) => r.complete);
   /**
-   * The gate. All three conditions, and nothing else, permit a destructive write or a
-   * recorded advance: a complete fetch, in the mode that actually rescanned the whole
-   * competition, with every record understood.
+   * Kept meaning exactly what it meant before -- "we did not get everything we asked for" -- and
+   * NOT widened to "something was unreadable". It is stored in `sync_state.truncated` and shown to
+   * admins, so folding a malformed record into it would report a data-quality problem as a
+   * pagination problem.
    */
-  const complete = fetchError === null && fetched.truncated !== true && malformed === 0;
+  const truncated = !allMonthsReached || results.some((r) => r.truncated);
 
   let activitiesRemoved = 0;
-  if (complete && mode === 'full') {
-    // The reconcile range is deliberately NARROWER than the fetch window: the fetch uses
-    // Strava's `after`/`before`, whose inclusivity is [UNVERIFIED]. `afterEpoch + 1` and a
-    // half-open upper bound mean that under either reading, a ride Strava might not have
-    // returned is outside the range and cannot be soft-deleted. Being one second too
-    // conservative costs nothing; being one second too greedy deletes a real ride.
-    activitiesRemoved = await reconcileDeletions(
-      db,
-      athleteId,
-      { startEpoch: window.afterEpoch + 1, endEpoch: window.beforeEpoch },
-      seenIds,
-      nowEpoch,
-    );
+  if (mode === 'full') {
+    // Reconciled MONTH BY MONTH, against that month's own fetch. A month that came back short
+    // reconciles nothing while its neighbours still do -- which is the substantive gain over one
+    // wide window, where a single truncated page suppressed deletions for the entire season (or,
+    // worse, would have authorized them across months that were never asked for).
+    //
+    // `startEpoch`/`endEpoch` are the UNPADDED half-open month, always strictly inside the
+    // ±86400 s window that was actually sent. Strava's `after`/`before` inclusivity is
+    // [UNVERIFIED], so under either reading a ride Strava might not have returned is outside this
+    // range and cannot be soft-deleted. Being conservative costs nothing; being greedy deletes a
+    // real ride.
+    for (const r of results) {
+      if (!r.complete) continue;
+      activitiesRemoved += await reconcileDeletions(
+        db,
+        athleteId,
+        { startEpoch: r.startEpoch, endEpoch: r.endEpoch },
+        r.seenIds,
+        nowEpoch,
+      );
+    }
   }
 
-  if (fetchError === null && fetched.truncated !== true) {
-    // `last_full_sync_at` is only stamped when reconciliation actually ran, so a run that
-    // skipped it comes back as 'full' on the next attempt instead of being suppressed for a
-    // day. advanceWatermark itself is max(), so it can never move backwards.
+  if (fetchError === null) {
+    // `last_full_sync_at` is only stamped when every month reconciled, so a run that skipped one
+    // comes back as 'full' on the next attempt instead of being suppressed for a day.
+    // advanceWatermark itself is max(), so it can never move backwards.
     await advanceWatermark(db, athleteId, watermarkEpoch, {
       fullSyncAt: complete && mode === 'full' ? nowEpoch : null,
     });
@@ -423,19 +486,14 @@ async function runSync(db, config, strava, athleteId, { mode, nowMs, nowEpoch, s
     ok: true,
     mode,
     syncedAt,
-    /**
-     * The floor ACTUALLY fetched from, after every clamp -- not the `sinceMonth` that was asked
-     * for. They differ whenever the request named a month later than the current one or older than
-     * SYNC_MAX_MONTHS, and reporting the request instead would let the backfill claim to have
-     * covered a month it never asked Strava about.
-     */
-    firstMonth: window.firstMonth,
-    activitiesScanned: fetched.activities.length,
+    /** The months actually asked for, oldest first. The evidence that each one was requested. */
+    monthsSynced: results.map((r) => r.month),
+    activitiesScanned: scannedIds.size + unkeyableScanned,
     activitiesCounted: countCountable(config, rows),
     activitiesAdded,
     activitiesRemoved,
-    pagesFetched: fetched.pages,
-    truncated: fetched.truncated === true,
+    pagesFetched,
+    truncated,
   };
 }
 

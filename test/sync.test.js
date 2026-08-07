@@ -102,22 +102,24 @@ async function countRows(db, where = '', params = []) {
 
 // ------------------------------------------------------- the widened fetch floor
 
-test('a full sync fetches back to the months that already hold rides', async () => {
-  // THE REGRESSION, reported as "a lot of rides aren't being shown for months like July and
-  // prior". `computeSyncWindow` floors the fetch range at the earliest of {configured first
-  // month, current month, first month holding rides}. Before that third source existed, a
-  // COMPETITION_START in the future -- which is what shipped -- pushed the floor onto the first
-  // of the CURRENT month, every month, forever. Since /athlete/activities has no
-  // `modified_after`, the full rescan that exists to catch late uploads and privacy flips never
-  // went back for July, so July's board froze at whatever was fetched while July was current.
+test('a full sync asks Strava for every month by name, July included', async () => {
+  // THE REGRESSION, reported as "a lot of rides aren't being shown for months like July and prior",
+  // and then as "running backfill still doesn't get me the correct data".
   //
-  // This is the wiring half of the fix: map.js can compute the widened floor, but only sync.js
-  // can read the extent to compute it FROM, and a window that is right in a unit test and never
-  // reaches the client is the same outage.
+  // The fetch used to be ONE wide range whose floor was the earliest of {configured first month,
+  // current month, first month holding rides}. That third source is derived from the rows the fetch
+  // itself writes, so a month missed once was unreachable by all three forever: re-syncing
+  // recomputed the identical range and recovered nothing, while still reporting `ok`. Sync now
+  // walks the months and asks for each one, so "was July fetched" is a question about a list rather
+  // than about arithmetic.
+  //
+  // This is the wiring half: map.js can build the list, but only sync.js can read the stored extent
+  // it is widened from, and a plan that is right in a unit test and never reaches Strava is the
+  // same outage.
   const ctx = await setup({ configOverrides: { COMPETITION_START: '2026-12-01', COMPETITION_END: '2026-12-31' } });
 
-  // A stored July ride is the only thing that can pull the floor back: NOW is 2026-09-02 and
-  // the configured season is December, so config and clock alone floor this at September 1.
+  // A stored July ride is what pulls the list back: NOW is 2026-09-02 and the configured season is
+  // December, so config and clock alone would ask for September only.
   await seedActivity(ctx.db, { id: 99000001, athleteId: ATHLETE_ID, localDate: '2026-07-04' });
 
   await sync(ctx, { mode: 'full' });
@@ -125,30 +127,92 @@ test('a full sync fetches back to the months that already hold rides', async () 
   const pages = ctx.fake.requests.filter((r) => r.pathname.endsWith('/athlete/activities'));
   assert.ok(pages.length > 0, 'no activity page was requested at all');
 
-  const julyFirst = Math.floor(Date.parse('2026-07-01T00:00:00Z') / 1000);
+  // Group the requests by the window they carried: one group per month, however many pages it took.
+  const windows = new Map();
   for (const page of pages) {
-    const after = Number(page.query.after);
-    assert.ok(
-      after <= julyFirst,
-      `asked Strava for after=${new Date(after * 1000).toISOString()}, which misses July`,
-    );
-    // Every page must carry the SAME bounds. Paging with a moving window silently skips
-    // records, because page N means different rides once the filter changes underneath it.
-    assert.equal(page.query.after, pages[0].query.after);
-    assert.equal(page.query.before, pages[0].query.before);
+    const key = `${page.query.after}..${page.query.before}`;
+    windows.set(key, (windows.get(key) ?? 0) + 1);
   }
 
-  // And the rides really landed: the fixture's July records are now stored, which is the
-  // outcome the rider was reporting as missing. Counted off the fixture rather than hardcoded,
-  // because this is EVERY July record (rule 1: store everything) and not the 6 countable ones
-  // that `JUL.records` describes. The seeded row is excluded -- Strava does not report it, so a
-  // full sync correctly reconciles it away; that is the next test's subject.
+  // Every month from July (the stored ride) to September (now) was asked for by name -- and each
+  // one is checked by finding a window that actually brackets the middle of it, not by trusting a
+  // month string.
+  for (const [month, probe] of [['2026-07', '2026-07-15'], ['2026-08', '2026-08-15'], ['2026-09', '2026-09-01']]) {
+    const mid = Math.floor(Date.parse(`${probe}T12:00:00Z`) / 1000);
+    assert.ok(
+      [...windows.keys()].some((k) => {
+        const [after, before] = k.split('..').map(Number);
+        return mid > after && mid < before;
+      }),
+      `no request covered ${month} -- that month would be silently short`,
+    );
+  }
+
+  // Pages WITHIN one month must carry identical bounds. Paging with a moving window silently skips
+  // records, because page N means different rides once the filter changes underneath it. (Across
+  // months the bounds differ on purpose -- that is the whole change.)
+  for (const [key, count] of windows) {
+    const monthPages = pages.filter((p) => `${p.query.after}..${p.query.before}` === key);
+    assert.equal(monthPages.length, count);
+    for (const page of monthPages) {
+      assert.equal(page.query.after, monthPages[0].query.after);
+      assert.equal(page.query.before, monthPages[0].query.before);
+    }
+  }
+
+  // And the rides really landed: the fixture's July records are now stored, which is the outcome
+  // the rider was reporting as missing. Counted off the fixture rather than hardcoded, because this
+  // is EVERY July record (rule 1: store everything) and not the 6 countable ones that `JUL.records`
+  // describes. The seeded row is excluded -- Strava does not report it, so a full sync correctly
+  // reconciles it away; that is the next test's subject.
   const julyInFixture = ACTIVITY_FIXTURE.activities
     .filter((a) => String(a.start_date_local).startsWith('2026-07')).length;
   assert.equal(
     await countRows(ctx.db, `local_date LIKE '2026-07-%' AND strava_activity_id != ? AND deleted_at IS NULL`, [99000001]),
     julyInFixture,
   );
+});
+
+test('an ordinary full sync recovers old months on its own, with no backfill step', async () => {
+  // THE OUTCOME THE WHOLE CHANGE IS FOR, and the reason there is no recovery tool. Nothing is
+  // stored, and the config is the real deployed one: COMPETITION_START backdated to January. Every
+  // month from January to now is asked for by name, so an ordinary `POST /api/me/sync` -- a rider
+  // pressing Refresh -- fills in months that a narrower fetch had skipped. Under the old single
+  // window this needed a separate run against a widened floor, and that floor could not reach a
+  // month holding no rides in the first place.
+  //
+  // Note the months BEFORE the fixture's data (Jan..Apr) are still requested. That is the point:
+  // "was April fetched" must be answerable without knowing whether April happens to have rides.
+  const ctx = await setup({ configOverrides: { COMPETITION_START: '2026-01-01', COMPETITION_END: '2026-09-30' } });
+
+  const res = await sync(ctx, { mode: 'full' });
+
+  assert.deepEqual(res.monthsSynced, [
+    '2026-01', '2026-02', '2026-03', '2026-04', '2026-05',
+    '2026-06', '2026-07', '2026-08', '2026-09',
+  ]);
+  assert.equal(res.truncated, false);
+  assert.equal(res.activitiesScanned, EXPECTED.total_records, 'distinct ids, not inflated by the pad overlap');
+
+  // June and July -- the months that were reported missing -- are fully stored, from a plain sync.
+  for (const month of ['2026-06', '2026-07', '2026-08']) {
+    assert.equal(
+      await countRows(ctx.db, `local_date LIKE '${month}-%' AND deleted_at IS NULL`),
+      ACTIVITY_FIXTURE.activities.filter((a) => String(a.start_date_local).startsWith(month)).length,
+      `${month} did not land in full`,
+    );
+  }
+
+  // One request per month, plus the second page August needs. Asserted so the rate-limit cost of
+  // this design is a number someone has to consciously change, not a surprise.
+  const pages = ctx.fake.requests.filter((r) => r.pathname.endsWith('/athlete/activities'));
+  assert.equal(pages.length, 10, '9 months + one extra page for August');
+
+  // And a second run is idempotent -- it re-asks for every month and changes nothing.
+  const again = await sync(ctx, { mode: 'full', force: true });
+  assert.equal(again.activitiesAdded, 0);
+  assert.equal(again.activitiesRemoved, 0);
+  assert.deepEqual(again.monthsSynced, res.monthsSynced);
 });
 
 test('the widened window reconciles the months it now actually fetched', async () => {
@@ -177,96 +241,6 @@ test('the widened window reconciles the months it now actually fetched', async (
   assert.equal(ancient.deleted_at, null, 'a row outside the fetch window must never be reconciled away');
 });
 
-// ------------------------------------------------------- sinceMonth: the explicit floor
-
-test('sinceMonth reaches months NOTHING is stored for, which is the only way to recover them', async () => {
-  // THE REPORTED BUG: "running backfill still doesn't get me the correct data for months prior to
-  // September and August". Re-running the backfill could not possibly have helped, and this test
-  // says why in two halves.
-  //
-  // The fetch floor is the earliest of {configured first month, current month, first month that
-  // HOLDS rides}. That third source is derived from the rows the fetch itself writes, so it is
-  // circular: it can only widen to a month that already has data. With COMPETITION_START in the
-  // future and an EMPTY table, all three sources agree on the current month, so every run computes
-  // the identical window and recovers nothing -- forever, with no error and an `ok` status.
-  const configOverrides = { COMPETITION_START: '2026-12-01', COMPETITION_END: '2026-12-31' };
-
-  // Half one: the stuck state. NOW is 2026-09-02, so the floor is September 1 and every June and
-  // July ride is outside the window. A full sync succeeds and stores none of them. (August 31 does
-  // land: the window is padded a day on each end, which is a full month short of recovering July.)
-  const stuck = await setup({ configOverrides });
-  const before = await sync(stuck, { mode: 'full' });
-  assert.equal(before.ok, true, 'the stuck sync reports success, which is what made this invisible');
-  assert.equal(await countRows(stuck.db, `local_date < '2026-08-01'`), 0, 'precondition: nothing before August');
-  assert.equal(await countRows(stuck.db, `local_date LIKE '2026-07-%'`), 0, 'precondition: no July rides');
-
-  // Half two: naming the month. Same config, same empty table, one extra argument.
-  const ctx = await setup({ configOverrides });
-  const res = await sync(ctx, { mode: 'full', sinceMonth: '2026-06' });
-
-  assert.equal(res.truncated, false);
-  assert.equal(res.activitiesScanned, EXPECTED.total_records, 'the whole fixture is inside the window now');
-
-  const pages = ctx.fake.requests.filter((r) => r.pathname.endsWith('/athlete/activities'));
-  assert.ok(pages.length > 0, 'no activity page was requested at all');
-  const juneFirst = Math.floor(Date.parse('2026-06-01T00:00:00Z') / 1000);
-  for (const page of pages) {
-    assert.ok(
-      Number(page.query.after) <= juneFirst,
-      `asked Strava for after=${new Date(Number(page.query.after) * 1000).toISOString()}, which misses June`,
-    );
-    // Every page must carry the SAME bounds. Paging with a moving window silently skips records,
-    // because page N means different rides once the filter changes underneath it.
-    assert.equal(page.query.after, pages[0].query.after);
-    assert.equal(page.query.before, pages[0].query.before);
-  }
-
-  // EVERY month landed, not just the endpoints. Recovering June and August while silently missing
-  // July is the exact failure `activityMonthlyTotals` was added to expose, so it is asserted here
-  // rather than left to a spot check of the earliest month.
-  for (const [month, expected] of Object.entries(EXPECTED.by_month)) {
-    assert.equal(
-      await countRows(ctx.db, `local_date LIKE '${month}-%' AND deleted_at IS NULL`),
-      ACTIVITY_FIXTURE.activities.filter((a) => String(a.start_date_local).startsWith(month)).length,
-      `${month} did not land in full (expected ${expected.records} countable)`,
-    );
-  }
-});
-
-test('a narrow sinceMonth cannot reconcile away the months it did not fetch', async () => {
-  // Narrowing is supported -- it is the chunking escape hatch for a history that truncates -- and
-  // this is the property that makes it safe to support. The fetch window and the reconcile range
-  // are derived from the one `window` object, so `reconcile ⊆ fetch` holds by construction. If it
-  // did not, `--since 2026-08` would soft-delete every June and July ride as "no longer reported
-  // by Strava" and quietly zero half the season.
-  const ctx = await setup();
-
-  // Everything first, so there are real June and July rows to endanger.
-  await sync(ctx, { mode: 'full', sinceMonth: '2026-06' });
-  const julyBefore = await countRows(ctx.db, `local_date LIKE '2026-07-%' AND deleted_at IS NULL`);
-  const juneBefore = await countRows(ctx.db, `local_date LIKE '2026-06-%' AND deleted_at IS NULL`);
-  assert.ok(julyBefore > 0 && juneBefore > 0, 'precondition: June and July are stored');
-
-  // Now a deliberately narrow re-sync. `force` skips the cooldown; the fixture is unchanged, so a
-  // correct run has nothing to delete anywhere.
-  await sync(ctx, { mode: 'full', force: true, sinceMonth: '2026-09' });
-
-  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-07-%' AND deleted_at IS NULL`), julyBefore);
-  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-06-%' AND deleted_at IS NULL`), juneBefore);
-});
-
-test('a malformed sinceMonth fails the sync instead of silently using the default floor', async () => {
-  // It arrives from a command line and from an admin request body. Falling back to the union would
-  // run the backfill over exactly the range that was already broken and report success, so the
-  // operator would conclude the rides are genuinely gone upstream.
-  const ctx = await setup();
-  await assert.rejects(() => sync(ctx, { mode: 'full', sinceMonth: '2026-13' }), /sinceMonth/);
-
-  // And the lock is not left behind by the throw -- the `finally` in syncAthlete owns that.
-  const state = await getSyncState(ctx.db, ATHLETE_ID);
-  assert.equal(state?.lock_expires_at ?? null, null, 'a rejected sync must not leave the athlete locked');
-});
-
 // ------------------------------------------------------- the whole fixture, end to end
 
 test('a full sync stores EVERY record, counts only the countable ones, and totals 224.0 mi', async () => {
@@ -277,7 +251,11 @@ test('a full sync stores EVERY record, counts only the countable ones, and total
   assert.equal(res.ok, true);
   assert.equal(res.mode, 'full', 'no last_full_sync_at => auto mode picks full');
   assert.equal(res.truncated, false);
-  assert.equal(res.pagesFetched, 2, '216 records at per_page=200 is two pages, ending short');
+  // Jun, Jul, Aug, Sep -- one request each, except August's 202 rides needing a second page. This
+  // is the cost of asking per month, stated as a number so a change to it is deliberate: the old
+  // single window was 2 pages total.
+  assert.deepEqual(res.monthsSynced, ['2026-06', '2026-07', '2026-08', '2026-09']);
+  assert.equal(res.pagesFetched, 5, '4 months, and August alone needs 2 pages at per_page=200');
   assert.equal(typeof res.syncedAt, 'string');
 
   // Rule 1: store everything, filter at query time. The Run, the e-bikes, the out-of-window
@@ -410,9 +388,11 @@ test('two syncs leave COUNT(*) unchanged, and an edited distance updates in plac
 
 test('a 500 mid-pagination persists the earlier page, leaves the watermark unmoved, and deletes nothing', async () => {
   const ctx = await setup();
-  // API call 1 is GET /athlete, call 2 is activities page 1. From call 3 on, page 2 fails --
-  // three times, because the client retries an idempotent GET twice before giving up.
-  ctx.fake.queue500(3, { afterCalls: 2 });
+  // Call 1 is GET /athlete. Then one call per month: 2 = June, 3 = July, 4 = August page 1. From
+  // call 5 on, August's page 2 fails -- three times, because the client retries an idempotent GET
+  // twice before giving up. Aimed at August specifically because it is the only month big enough to
+  // paginate, so this still tests a failure MID-PAGINATION rather than merely mid-month-loop.
+  ctx.fake.queue500(3, { afterCalls: 4 });
 
   await assert.rejects(
     () => sync(ctx),
@@ -423,21 +403,53 @@ test('a 500 mid-pagination persists the earlier page, leaves the watermark unmov
     },
   );
 
-  // Page 1's rows are real data and the upsert is idempotent, so throwing them away would
-  // cost a rate-limited re-fetch for nothing.
-  assert.equal(await countRows(ctx.db), 200, 'the delivered page is persisted');
+  // Everything delivered is real data and the upsert is idempotent, so throwing it away would cost
+  // a rate-limited re-fetch for nothing. June and July completed outright; August's first page
+  // arrived before the failure.
+  const junInFixture = ACTIVITY_FIXTURE.activities.filter((a) => String(a.start_date_local).startsWith('2026-06')).length;
+  const julInFixture = ACTIVITY_FIXTURE.activities.filter((a) => String(a.start_date_local).startsWith('2026-07')).length;
+  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-06-%'`), junInFixture, 'June completed and must be stored');
+  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-07-%'`), julInFixture, 'July completed and must be stored');
+  assert.ok(await countRows(ctx.db) >= 200, "August's delivered page is persisted too");
 
   const state = await getSyncState(ctx.db, ATHLETE_ID);
   // THE assertion. Advancing past pages that never arrived makes the gap permanent: the next
   // incremental sync starts above the missing rides and never asks for them again.
-  assert.equal(state.watermark_epoch, 0, 'a truncated run must not advance the watermark');
+  assert.equal(state.watermark_epoch, 0, 'a failed run must not advance the watermark');
   assert.equal(state.last_full_sync_at, null, 'nor claim a full reconciliation happened');
   assert.equal(state.last_status, 'error');
   assert.equal(state.lock_expires_at, null, 'the lock is released even on the failure path');
   assert.ok(state.last_error.length > 0);
 
-  // And nothing is soft-deleted. Reconciling against 200 of 216 rides would have wiped 16.
+  // Nothing is soft-deleted anywhere. August was never completely fetched, so its rows are not
+  // reconciled -- reconciling against 200 of its 202 rides would have wiped 2 real rides. June and
+  // July WERE complete and are reconciled, but Strava returned everything they were asked for, so
+  // there is nothing for that pass to remove.
   assert.equal(await countRows(ctx.db, 'deleted_at IS NOT NULL'), 0);
+});
+
+test('one month coming back short cannot suppress OR authorize deletions in another', async () => {
+  // The substantive gain from fetching per month. The old shape reconciled one wide range gated on
+  // one flag, so ANY failure suppressed deletions for the whole season -- a ride deleted in June
+  // kept scoring for as long as August's fetch kept hiccuping. Reconciling per month against that
+  // month's own fetch decouples them, and the decoupling has to cut both ways: the incomplete
+  // month must also be protected FROM reconciliation, or a partial August would soft-delete the
+  // pages that never arrived.
+  const ctx = await setup();
+
+  // Two rows Strava does not report, one in each month.
+  await seedActivity(ctx.db, { id: 99000010, athleteId: ATHLETE_ID, localDate: '2026-07-04' });
+  await seedActivity(ctx.db, { id: 99000011, athleteId: ATHLETE_ID, localDate: '2026-08-04' });
+
+  // August's second page fails; see the call accounting in the test above.
+  ctx.fake.queue500(3, { afterCalls: 4 });
+  await assert.rejects(() => sync(ctx), (err) => err instanceof StravaError);
+
+  const july = await getActivity(ctx.db, 99000010);
+  assert.notEqual(july.deleted_at, null, 'July was fetched completely, so its phantom must be reconciled away');
+
+  const august = await getActivity(ctx.db, 99000011);
+  assert.equal(august.deleted_at, null, 'August was truncated, so nothing in it may be soft-deleted');
 });
 
 test('a Strava 429 becomes HttpError 429 {scope:"strava"} without sleeping', async () => {

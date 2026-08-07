@@ -27,7 +27,7 @@ import { freshDb, seedAthlete, seedSession, testConfig, SENTINEL_SECRET } from '
  * A fixed clock, inside the competition window and late enough that the whole activity
  * fixture is in the past.
  *
- * This is why buildRoutes takes `now`. `computeSyncWindow` clamps the fetch to
+ * This is why buildRoutes takes `now`. `computeSyncMonths` clamps the fetch to
  * `min(now, COMPETITION_END)`, so with the real clock the fixture's August rides are in the
  * future and every mileage assertion in this suite would depend on the day it was run.
  */

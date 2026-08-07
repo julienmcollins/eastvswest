@@ -227,7 +227,7 @@ export function monthBounds(config, nowMs = Date.now(), dataMonths = null) {
      *
      * The RANGE widened to a union; the DEFAULT did not, and that asymmetry is the point. The
      * configured season is still the operator's statement about which month a reader should land
-     * on, and it is also the only range sync ever fetches (`computeSyncWindow`). Defaulting to
+     * on, and it is also the floor of the months sync fetches (`computeSyncMonths`). Defaulting to
      * the current month regardless would mean that a September-only competition viewed in August
      * opens on August: a board that is guaranteed empty because those rides are never fetched,
      * captioned "open, 27 days to go" beside zero miles, which reads as a broken sync rather than

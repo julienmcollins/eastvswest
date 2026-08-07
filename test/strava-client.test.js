@@ -11,7 +11,7 @@ import {
   StravaRateLimitError,
 } from '../server/strava/client.js';
 import { assertScope } from '../server/strava/authUrl.js';
-import { computeSyncWindow, nextQuarterHourMs, nextUtcMidnightMs } from '../server/strava/map.js';
+import { computeSyncMonths, nextQuarterHourMs, nextUtcMidnightMs } from '../server/strava/map.js';
 import { createFakeStrava, ACTIVITY_FIXTURE } from './helpers/fakeStrava.js';
 import { testConfig } from './helpers/testDb.js';
 
@@ -188,10 +188,13 @@ test('the watermark is Math.max over all pages and is identical ascending or des
 test('the padded window captures the UTC+13 edge ride under BOTH before/after semantics', async () => {
   const config = testConfig();
   const auckland = ACTIVITY_FIXTURE.activities.find((a) => a._why.includes('UTC+13 edge'));
-  const { afterEpoch, beforeEpoch } = computeSyncWindow(config, {
-    mode: 'full',
-    nowMs: Date.parse('2026-09-15T00:00:00Z'),
-  });
+  // Its `start_date_local` is 2026-06-01T00:30 with a UTC instant of 2026-05-31T11:30 -- so the
+  // ride sits in JUNE's month, and June's window is the one that has to cover it under either
+  // reading. That is the whole reason the per-month windows are still padded by a day on each
+  // end rather than being exact month boundaries.
+  const june = computeSyncMonths(config, { mode: 'full', nowMs: Date.parse('2026-09-15T00:00:00Z') })
+    .months.find((m) => m.month === '2026-06');
+  assert.ok(june, 'June must be in the plan for this test to mean anything');
 
   for (const field of ['start_date', 'start_date_local']) {
     const fake = quietFake();
@@ -199,8 +202,8 @@ test('the padded window captures the UTC+13 edge ride under BOTH before/after se
     const { client } = makeClient(fake);
     const res = await client.fetchAllActivities({
       accessToken: fake.tokens.accessToken,
-      after: afterEpoch,
-      before: beforeEpoch,
+      after: june.afterEpoch,
+      before: june.beforeEpoch,
       perPage: 200,
     });
     assert.ok(
