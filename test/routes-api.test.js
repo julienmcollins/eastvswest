@@ -267,6 +267,66 @@ test('a mutating request without X-CSRF-Token, from a foreign Origin, or as text
 
 // ---------------------------------------------------------------- sync
 
+test('POST /api/me/sync with include_others sweeps the whole roster', async () => {
+  // "When I hit refresh, it should refresh all the riders, not just me." Opt-in on the wire, because
+  // public/app.js also syncs automatically on every page load -- fanning THAT out would make opening
+  // a tab a roster sweep and spend Strava quota in proportion to how often anyone looks at the page.
+  // Two harnesses rather than two calls: the caller's own 60-second cooldown would refuse the second
+  // sync in the same instant with a 429, which is correct behaviour and would say nothing about the
+  // flag under test.
+  const solo = await (async () => {
+    const { app, fake } = await harness();
+    const auth = await signIn(app, fake);
+    await post(app, '/api/me/team', { team: 'EAST' }, auth);
+    // Without the flag: `others` is null rather than a zeroed object, so "no sweep was asked for"
+    // stays distinguishable from "a sweep found nothing to do".
+    return post(app, '/api/me/sync', { mode: 'full' }, auth);
+  })();
+  assert.equal(solo.status, 200);
+  assert.equal(solo.json.others, null);
+
+  const { app, fake, db } = await harness();
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+  await seedAthlete(db, { id: 44444444, name: 'Priya R', team: 'WEST' });
+
+  const swept = await post(app, '/api/me/sync', { mode: 'full', include_others: true }, auth);
+  assert.equal(swept.status, 200);
+  assert.equal(swept.json.ok, true);
+  // Priya has a team but has never connected, so she is skipped without spending a request.
+  assert.deepEqual(swept.json.others, { attempted: 0, synced: 0, skipped: 1, failed: 0, rate_limited: false });
+
+  // The embedded board is built AFTER the sweep, or Refresh would return the roster as it was a
+  // moment before and look like nothing happened.
+  assert.equal(swept.json.leaderboard.riders.length, 2);
+});
+
+test('a teammate who cannot sync does not fail the caller\'s refresh', async () => {
+  // The caller pressed a button and it worked. A teammate needing to reconnect is not theirs to see
+  // as an error, and turning it into one would make Refresh look broken for everybody whenever any
+  // single rider's grant lapsed.
+  const { app, fake, db } = await harness();
+  const auth = await signIn(app, fake);
+  await post(app, '/api/me/team', { team: 'EAST' }, auth);
+
+  // On the board, connected, but holding tokens that cannot be decrypted or refreshed.
+  await seedAthlete(db, { id: 44444444, name: 'Priya R', team: 'WEST' });
+  await db.run(
+    `INSERT INTO oauth_tokens (athlete_id, access_token_enc, refresh_token_enc, expires_at, scope, token_type, token_version, updated_at)
+     VALUES (?,?,?,?,?,?,?,?)`,
+    [44444444, 'v1.bogus.bogus.bogus', 'v1.bogus.bogus.bogus', 0, 'read,activity:read_all', 'Bearer', 1,
+     '2026-08-01T00:00:00.000Z'],
+  );
+
+  const res = await post(app, '/api/me/sync', { mode: 'full', include_others: true }, auth);
+
+  assert.equal(res.status, 200, "a teammate's broken grant must not 4xx the caller");
+  assert.equal(res.json.others.failed, 1);
+  assert.equal(res.json.others.synced, 0);
+  // And the caller's own sync still landed in full.
+  assert.equal(res.json.activities_scanned, FIXTURE.expected.total_records);
+});
+
 test('POST /api/me/sync stores the fixture and embeds the whole leaderboard', async () => {
   const { app, fake, db } = await harness();
   const auth = await signIn(app, fake);

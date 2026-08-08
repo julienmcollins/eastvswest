@@ -234,13 +234,20 @@ export function setTeam(team) {
  * `month` is the month ON SCREEN, sent so the embedded board comes back for it. Omitting it
  * would make Refresh silently snap the view from June to the current month.
  *
+ * `includeOthers` asks the server to sync EVERY rider, not just this one. Opt-in because the
+ * automatic sync on page load must stay cheap: fanning that out would make opening the tab a
+ * roster sweep, and the app would spend Strava's rate limit in proportion to how often anyone
+ * looked at it. An explicit Refresh press sets it; boot does not.
+ *
  * @param {'incremental'|'full'} [mode] omit to let the server choose
  * @param {string} [month] `YYYY-MM`; omit for the server's default month
+ * @param {{includeOthers?: boolean}} [options]
  */
-export function syncNow(mode, month) {
+export function syncNow(mode, month, options = {}) {
   const body = {};
   if (mode) body.mode = mode;
   if (typeof month === 'string' && /^\d{4}-\d{2}$/.test(month)) body.month = month;
+  if (options.includeOthers === true) body.include_others = true;
   return request('/api/me/sync', { method: 'POST', body });
 }
 

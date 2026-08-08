@@ -463,6 +463,37 @@ function stepMonth(direction) {
 }
 
 /**
+ * What to say after a sync, given the roster sweep's outcome.
+ *
+ * "Up to date." unconditionally is the thing worth avoiding. When the sweep stops on a Strava rate
+ * limit, the tail of the roster was NOT refreshed and the board on screen is partly stale -- saying
+ * it is up to date there is the same class of lie as the Refresh button that could not fix July.
+ * Riders skipped for their own cooldown are not worth mentioning: they synced moments ago, so the
+ * board really is current for them.
+ *
+ * Exported and pure so this is testable without a DOM, which is the rule for every non-trivial
+ * decision in this file.
+ *
+ * @param {{synced?: number, failed?: number, rate_limited?: boolean}|null} others
+ * @returns {string}
+ */
+export function syncStatusMessage(others) {
+  if (others === null || others === undefined) return 'Up to date.';
+
+  const synced = Number(others.synced) || 0;
+  const riders = `${synced} other rider${synced === 1 ? '' : 's'}`;
+
+  if (others.rate_limited === true) {
+    return `Synced you and ${riders}, then Strava's rate limit stopped the rest. Try again in a few minutes.`;
+  }
+  const failed = Number(others.failed) || 0;
+  if (failed > 0) {
+    return `Up to date. ${failed} rider${failed === 1 ? '' : 's'} could not be synced and may need to reconnect.`;
+  }
+  return synced === 0 ? 'Up to date.' : `Up to date — synced you and ${riders}.`;
+}
+
+/**
  * Refresh: POST /api/me/sync, whose response embeds a whole leaderboard payload, so this
  * is one round trip.
  *
@@ -473,9 +504,15 @@ function stepMonth(direction) {
  * July, reported "Up to date.", and left the board unchanged. A button labelled Refresh has to
  * actually re-ask for every month.
  *
- * The automatic boot sync stays on auto (`reason: 'first-sync'`): a brand-new rider has no
- * `last_full_sync_at`, so auto already resolves to full for them, and a returning rider gets the
- * cheap incremental on page load instead of a full rescan every time they open the tab.
+ * `includeOthers` on an explicit press too: the board is shared, so a rider refreshing it wants
+ * everyone's current miles, not their own against a roster that last updated whenever each
+ * teammate happened to open the page. The server syncs the caller first and then sweeps the rest on
+ * AUTO mode without forcing, so each teammate's own 60-second cooldown throttles it -- five people
+ * pressing Refresh in the same minute produce one sweep, not five.
+ *
+ * The automatic boot sync gets NEITHER (`reason: 'first-sync'`). A brand-new rider has no
+ * `last_full_sync_at`, so auto already resolves to full for them; a returning rider gets the cheap
+ * incremental on page load instead of a full rescan of the whole roster every time they open a tab.
  *
  * Cost, since a full sync is one Strava request per month: the 60-second per-athlete cooldown
  * bounds a single rider to one of these a minute, and the client's own rate-limit reserve refuses
@@ -491,18 +528,22 @@ async function refresh(options = {}) {
   ui.setRefreshPending(true);
   ui.setStatus(firstSync
     ? 'Fetching your rides from Strava for the first time…'
-    : 'Syncing your rides from Strava…');
+    : 'Syncing every rider from Strava…');
   try {
     // The month ON SCREEN goes with the sync, or the embedded board comes back for the
     // server's current month and Refresh silently snaps the view from June to August.
-    const result = await api.syncNow(firstSync ? undefined : 'full', state.month);
+    const result = await api.syncNow(
+      firstSync ? undefined : 'full',
+      state.month,
+      { includeOthers: !firstSync },
+    );
     const board = result?.leaderboard ?? null;
     // Hand the embedded board straight to loadAll instead of rendering it here and then
     // letting loadAll fetch and render it AGAIN. That double paint was the most visible
     // stutter in the app, on its slowest interaction: three round trips and two full roster
     // rebuilds where two round trips and one rebuild do the same work.
     await loadAll({ board });
-    ui.setStatus('Up to date.');
+    ui.setStatus(syncStatusMessage(result?.others ?? null));
   } catch (error) {
     await handleSyncError(error);
   } finally {

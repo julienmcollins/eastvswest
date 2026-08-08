@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { freshDb, testConfig, seedActivity, seedAthlete } from './helpers/testDb.js';
 import { createFakeStrava, ACTIVITY_FIXTURE } from './helpers/fakeStrava.js';
 import { createStravaClient, StravaError } from '../server/strava/client.js';
-import { syncAthlete, sweepStaleSyncLocks } from '../server/strava/sync.js';
+import { syncAthlete, syncOtherAthletes, sweepStaleSyncLocks } from '../server/strava/sync.js';
 import { _resetSingleFlightForTests } from '../server/strava/tokenService.js';
 import { saveTokens } from '../server/db/tokens.js';
 import { getActivity } from '../server/db/activities.js';
@@ -822,4 +822,129 @@ test('the padded window captures the UTC+13 edge ride under BOTH before/after re
   assert.equal(res.activitiesCounted, EXPECTED.counted_records);
   const row = await getActivity(ctx.db, 15000000012);
   assert.equal(row.local_date, '2026-06-01');
+});
+
+// ------------------------------------------------------- the roster sweep
+
+/** A second rider on the board, with tokens, so the sweep has somebody to sync. */
+async function seedTeammate(ctx, { id, team = 'WEST', ...over } = {}) {
+  await seedAthlete(ctx.db, { id, name: `Rider ${id}`, team, ...over });
+  await saveTokens(
+    ctx.db,
+    ctx.config,
+    id,
+    {
+      accessToken: ctx.fake.tokens.accessToken,
+      refreshToken: ctx.fake.tokens.refreshToken,
+      expiresAt: ctx.fake.tokens.expiresAt,
+      scope: 'read,activity:read_all',
+      tokenType: 'Bearer',
+    },
+    null,
+  );
+  return id;
+}
+
+test('the roster sweep syncs the OTHER riders and never the caller twice', async () => {
+  // "When I hit refresh, it should refresh all the riders, not just me." The board is shared, so a
+  // rider refreshing it wants everyone's current miles.
+  const ctx = await setup();
+  await seedTeammate(ctx, { id: 22222222 });
+  await seedTeammate(ctx, { id: 33333333 });
+
+  await sync(ctx, { mode: 'full' });
+  const summary = await syncOtherAthletes(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: NOW });
+
+  assert.equal(summary.attempted, 2);
+  assert.equal(summary.synced, 2);
+  assert.equal(summary.failed, 0);
+  assert.equal(summary.rateLimited, false);
+
+  // Each teammate really was synced, with their own sync_state row stamped.
+  for (const id of [22222222, 33333333]) {
+    const st = await getSyncState(ctx.db, id);
+    assert.notEqual(st?.last_sync_finished ?? null, null, `${id} has no recorded sync`);
+    assert.equal(st.last_status, 'ok');
+    assert.ok(Number(st.pages_fetched) > 0, `${id} fetched nothing`);
+  }
+
+  // NOT asserted: which athlete_id each activity row ends up under. The fake serves ONE activity
+  // fixture for every token, so all three riders legitimately "own" the same Strava activity ids
+  // here, and `UPSERT ... SET athlete_id = excluded.athlete_id` (deliberate -- it self-heals a
+  // mis-recorded owner) hands the rows to whoever synced last. Real Strava activity ids are unique
+  // per activity, so this cannot happen in production; asserting it would be testing the double.
+  assert.equal(await countRows(ctx.db), EXPECTED.total_records, 'the upsert stays idempotent across riders');
+});
+
+test('the sweep skips riders it cannot sync without spending a request on them', async () => {
+  // Every one of these would otherwise cost a Strava request, a token decrypt, or an error path to
+  // discover -- and the whole point of the sweep's rules is to protect the rate limit.
+  const ctx = await setup();
+  await seedTeammate(ctx, { id: 22222222, team: null });                       // not on the board
+  await seedTeammate(ctx, { id: 33333333 });
+  await seedAthlete(ctx.db, { id: 44444444, name: 'No Tokens', team: 'WEST' }); // never connected
+  // strava_revoked_at is INTEGER (unix seconds) in a STRICT table, not a timestamp string.
+  await ctx.db.run(`UPDATE athletes SET strava_revoked_at = ? WHERE strava_athlete_id = ?`, [NOW_SECONDS - 3600, 22222222]);
+
+  const before = ctx.fake.requests.length;
+  const summary = await syncOtherAthletes(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: NOW });
+
+  assert.equal(summary.attempted, 1, 'only the one syncable teammate is attempted');
+  assert.equal(summary.synced, 1);
+  assert.equal(summary.skipped, 2);
+  assert.equal(summary.failed, 0);
+  // The skips really were free: the only requests made belong to the one rider we did sync.
+  const spent = ctx.fake.requests.length - before;
+  assert.ok(spent > 0 && spent < 20, `expected one rider's worth of requests, got ${spent}`);
+});
+
+test("another rider's failure is never the caller's failure", async () => {
+  // Rule 3. A teammate whose refresh token has gone bad must not turn the caller's successful
+  // refresh into an error page -- they cannot fix it and it is not what they asked for.
+  const ctx = await setup();
+  await seedTeammate(ctx, { id: 22222222 });
+  // A token the fake will reject, and which cannot be refreshed.
+  await ctx.db.run(`UPDATE oauth_tokens SET access_token_enc = ?, refresh_token_enc = ? WHERE athlete_id = ?`,
+    ['v1.bogus.bogus.bogus', 'v1.bogus.bogus.bogus', 22222222]);
+
+  const summary = await syncOtherAthletes(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: NOW });
+
+  assert.equal(summary.failed, 1, 'the failure is counted');
+  assert.equal(summary.rateLimited, false);
+  // And it resolved rather than threw, which is the assertion: reaching this line is the test.
+  assert.equal(summary.synced, 0);
+});
+
+test('a teammate inside their own cooldown is a skip, not a failure -- that IS the throttle', async () => {
+  // Rule 2: the sweep never passes `force`, so each teammate's 60-second cooldown limits how often
+  // anyone else's button press can spend quota on them. Five people pressing Refresh in the same
+  // minute must produce one sweep's worth of requests, not five.
+  const ctx = await setup();
+  await seedTeammate(ctx, { id: 22222222 });
+
+  const first = await syncOtherAthletes(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: NOW });
+  assert.equal(first.synced, 1);
+
+  const spentAfterFirst = ctx.fake.requests.length;
+  const second = await syncOtherAthletes(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: NOW + 5_000 });
+
+  assert.equal(second.synced, 0);
+  assert.equal(second.skipped, 1, 'a cooldown refusal is a skip');
+  assert.equal(second.failed, 0, 'and NOT a failure -- nothing is wrong');
+  assert.equal(ctx.fake.requests.length, spentAfterFirst, 'the second sweep spent no Strava requests at all');
+});
+
+test('a Strava rate limit stops the sweep instead of hitting it once per rider', async () => {
+  // Rule 4. Strava's block is global to the app, so continuing would spend the caller's next
+  // refresh too -- and turn one 429 into one per teammate.
+  const ctx = await setup();
+  for (const id of [22222222, 33333333, 44444444]) await seedTeammate(ctx, { id });
+
+  ctx.fake.queue429(10, { bucket: 'short' });
+  const summary = await syncOtherAthletes(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: NOW });
+
+  assert.equal(summary.rateLimited, true, 'the caller has to be told the tail of the roster is stale');
+  assert.equal(summary.synced, 0);
+  // One rider attempted, then stopped. Without the break this would be 3.
+  assert.equal(summary.attempted, 1);
 });

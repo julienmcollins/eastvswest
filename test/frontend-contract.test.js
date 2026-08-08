@@ -631,6 +631,47 @@ describe('render.js shapeMonthPicker — the control that got reported missing',
   });
 });
 
+describe('syncStatusMessage', () => {
+  test('says "Up to date." only when it is actually true', () => {
+    // A solo sync (no sweep requested) has nothing to qualify.
+    assert.equal(app.syncStatusMessage(null), 'Up to date.');
+    assert.equal(app.syncStatusMessage(undefined), 'Up to date.');
+    // A sweep that found nobody to sync -- everyone was inside their own cooldown -- is genuinely
+    // up to date, so it must not invent a rider count.
+    assert.equal(app.syncStatusMessage({ synced: 0, skipped: 3, failed: 0, rate_limited: false }), 'Up to date.');
+  });
+
+  test('reports the rider count, singular and plural', () => {
+    assert.match(app.syncStatusMessage({ synced: 1, failed: 0, rate_limited: false }), /1 other rider\b/);
+    assert.match(app.syncStatusMessage({ synced: 4, failed: 0, rate_limited: false }), /4 other riders\b/);
+  });
+
+  test('a rate-limited sweep must NOT claim to be up to date', () => {
+    // THE assertion. When the sweep stops on Strava's limit, the tail of the roster was never
+    // refreshed and the board on screen is partly stale. Saying "Up to date." there is the same
+    // class of lie as the Refresh button that could not fix July, and it is the reason this
+    // function exists instead of a literal string at the call site.
+    const msg = app.syncStatusMessage({ synced: 2, failed: 0, rate_limited: true });
+    assert.ok(!/Up to date/.test(msg), `must not claim up-to-date: ${msg}`);
+    assert.match(msg, /rate limit/i);
+  });
+
+  test('failed riders are surfaced, because their miles on the board are stale', () => {
+    const msg = app.syncStatusMessage({ synced: 2, failed: 1, rate_limited: false });
+    assert.match(msg, /1 rider could not be synced/);
+    assert.match(app.syncStatusMessage({ synced: 0, failed: 2, rate_limited: false }), /2 riders could not be synced/);
+  });
+
+  test('tolerates a missing or malformed summary rather than rendering NaN', () => {
+    // It comes off the wire, so every field is untrusted.
+    for (const others of [{}, { synced: null }, { synced: 'two' }, { rate_limited: 'yes' }]) {
+      const msg = app.syncStatusMessage(others);
+      assert.equal(typeof msg, 'string');
+      assert.ok(!/NaN|undefined|null/.test(msg), `${JSON.stringify(others)} -> ${msg}`);
+    }
+  });
+});
+
 /* ============================================= DOM-free-at-import + api surface ==== */
 
 describe('module hygiene', () => {

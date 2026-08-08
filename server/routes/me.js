@@ -9,7 +9,7 @@ import { purgeAthleteActivities, selectableMonthBounds } from '../db/activities.
 import { getSyncState } from '../db/syncState.js';
 import { buildLeaderboard } from '../db/leaderboard.js';
 import { getValidAccessToken } from '../strava/tokenService.js';
-import { syncAthlete } from '../strava/sync.js';
+import { syncAthlete, syncOtherAthletes } from '../strava/sync.js';
 import {
   StravaError,
   StravaGrantRevokedError,
@@ -180,6 +180,16 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
     // while viewing June silently snaps the board to the current month.
     const month = requireMonthParam(body.month);
 
+    /**
+     * Sync the WHOLE ROSTER, not just this rider.
+     *
+     * Opt-in rather than always-on, and the reason is the automatic sync `public/app.js` fires on
+     * every page load for a signed-in rider: fanning that out would make opening the tab a roster
+     * sweep, so the app would spend Strava quota in proportion to how often anyone looked at it.
+     * An explicit Refresh press sends this; boot does not.
+     */
+    const includeOthers = body.include_others === true;
+
     let result;
     try {
       result = await syncAthlete(db, config, strava, session.athleteId, { mode, nowMs });
@@ -187,6 +197,16 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
       throw toHttpError(err, config);
     }
 
+    // AFTER the caller's own sync, and deliberately outside that try: `syncOtherAthletes` never
+    // throws for a teammate's failure, so there is nothing here to map onto an HTTP error. The
+    // caller's refresh has already succeeded by this point and must not be turned into a 4xx
+    // because somebody else needs to reconnect.
+    const others = includeOthers
+      ? await syncOtherAthletes(db, config, strava, session.athleteId, { nowMs })
+      : null;
+
+    // Built LAST, so it reflects every rider the sweep just updated. Building it before the
+    // fan-out would embed the roster as it was a moment ago and the board would look unchanged.
     const leaderboard = await buildLeaderboard(db, config, {
       month,
       viewerAthleteId: session.athleteId,
@@ -207,6 +227,22 @@ export function registerMeRoutes(router, { config, db, strava, now }) {
       // A rider with no team yet is absent from `riders` by contract, so 0 rather than
       // undefined -- the client renders this number directly.
       miles: me?.miles ?? 0,
+      /**
+       * The roster sweep's outcome, or null when one was not requested.
+       *
+       * Reported rather than silent because every non-`synced` count is a rider whose miles on the
+       * embedded board are older than this response implies. `rate_limited: true` in particular
+       * means the sweep stopped early, so the tail of the roster is stale -- and a UI that said
+       * "Up to date." over that would be the same class of lie as the Refresh button that could
+       * not fix July.
+       */
+      others: others === null ? null : {
+        attempted: others.attempted,
+        synced: others.synced,
+        skipped: others.skipped,
+        failed: others.failed,
+        rate_limited: others.rateLimited,
+      },
       leaderboard,
     });
   });

@@ -2,8 +2,9 @@ import { ERROR_CODES } from '../contracts.js';
 import { HttpError } from '../http/respond.js';
 import { log } from '../lib/log.js';
 import { isoUtcNow, startOfMonth, endOfMonth } from '../lib/dates.js';
-import { getAthlete as getAthleteRow, upsertAthleteFromStrava } from '../db/athletes.js';
+import { getAthlete as getAthleteRow, listAthletes, upsertAthleteFromStrava } from '../db/athletes.js';
 import { activityMonthExtent, reconcileDeletions, upsertActivities } from '../db/activities.js';
+import { hasTokens } from '../db/tokens.js';
 import {
   acquireLock,
   advanceWatermark,
@@ -531,6 +532,102 @@ function countCountable(config, rows) {
     counted += 1;
   }
   return counted;
+}
+
+/**
+ * Sync EVERY rider on the board, not just the one who pressed Refresh.
+ *
+ * The board is shared, so a rider looking at it wants everyone's current miles, not their own
+ * against a roster that last updated whenever each teammate happened to open the page. But
+ * fanning out multiplies the one genuinely scarce resource in this app -- Strava's 100 reads per
+ * 15 minutes -- by the size of the roster, so every rule below exists to keep one button press
+ * from consuming the quota that the next one needs.
+ *
+ *  1. THE PRESSING RIDER GOES FIRST, with whatever mode they asked for. Their own data is the
+ *     thing they are waiting on, and doing it first means a rate limit hit halfway down the
+ *     roster still leaves their press having worked.
+ *
+ *  2. EVERYONE ELSE GETS AUTO MODE, NEVER `force`. Auto is 'incremental' for the 24 hours after
+ *     each rider's own full sync, which is one request each; `FULL_SYNC_INTERVAL_SECONDS` still
+ *     gets them a full rescan daily, just not on someone else's button press. Declining to force
+ *     means each teammate's own 60-second cooldown throttles the fan-out for free: five people
+ *     pressing Refresh in the same minute produce one sweep, not five.
+ *
+ *  3. ANOTHER RIDER'S FAILURE IS NEVER THE CALLER'S FAILURE. A teammate with a revoked grant, an
+ *     expired refresh token or a sync already running must not turn the caller's successful
+ *     refresh into an error page. Outcomes are counted and returned; only the caller's own sync
+ *     is allowed to throw, and it throws from the caller, not here.
+ *
+ *  4. A RATE LIMIT STOPS THE SWEEP IMMEDIATELY. Every later rider would hit the same block, so
+ *     continuing turns one 429 into one per teammate -- and Strava's block is global to the app,
+ *     so it would be spending the caller's next refresh too.
+ *
+ *  5. RIDERS WHO CANNOT BE SYNCED ARE SKIPPED WITHOUT A REQUEST: no team (absent from the board
+ *     by contract, so nothing to show), revoked, disconnected, or no stored tokens.
+ *
+ * Sequential, never `Promise.all`. The rate-limit gate, the observed-429 block and the
+ * single-flight spacer in strava/client.js are all per-INSTANCE state on one shared client, and
+ * concurrent calls race all three -- the reserve could never engage and the sweep would walk
+ * straight into a block having already reported success for the riders it got to.
+ *
+ * @param {number} selfAthleteId the rider who pressed Refresh; synced first
+ * @param {{selfMode?: 'full'|'incremental'|null, nowMs?: number}} [opts]
+ * @returns {Promise<{attempted:number, synced:number, skipped:number, failed:number,
+ *   rateLimited:boolean}>} counts for the OTHER riders only; the caller's own outcome is its
+ *   own return value from `syncAthlete`.
+ */
+export async function syncOtherAthletes(db, config, strava, selfAthleteId, { nowMs = Date.now() } = {}) {
+  const summary = { attempted: 0, synced: 0, skipped: 0, failed: 0, rateLimited: false };
+
+  const roster = await listAthletes(db);
+  for (const row of roster) {
+    const id = Number(row.athlete_id);
+    if (id === Number(selfAthleteId)) continue;
+
+    // Rule 5. Each of these would cost a request (or a token decrypt) to discover the hard way.
+    if (row.team === null || row.team === undefined) { summary.skipped += 1; continue; }
+    if (row.strava_revoked_at !== null && row.strava_revoked_at !== undefined) { summary.skipped += 1; continue; }
+    if (row.disconnected_at !== null && row.disconnected_at !== undefined) { summary.skipped += 1; continue; }
+    if (!(await hasTokens(db, id))) { summary.skipped += 1; continue; }
+
+    summary.attempted += 1;
+    try {
+      // Rule 2: auto mode, and no `force`. A rider inside their own cooldown throws 429
+      // scope:'local', which the catch below counts as a skip -- that IS the throttle.
+      await syncAthlete(db, config, strava, id, { mode: null, nowMs });
+      summary.synced += 1;
+    } catch (err) {
+      // Rule 4. `translateStravaError` has already turned a Strava 429 into an HttpError with
+      // this code, and our own cooldown raises the same code with scope 'local' -- so the scope
+      // is what distinguishes "Strava is blocking us, stop" from "this teammate synced a moment
+      // ago, move on".
+      if (err?.code === ERROR_CODES.RATE_LIMITED) {
+        if (err?.extra?.scope === 'local') {
+          summary.attempted -= 1;
+          summary.skipped += 1;
+          continue;
+        }
+        summary.rateLimited = true;
+        log.warn('roster sync stopped by a Strava rate limit', {
+          athlete_id: id,
+          synced_so_far: summary.synced,
+          error_message: err?.message,
+        });
+        break;
+      }
+      // Rule 3. Logged at warn, counted, and swallowed: a teammate needing to reconnect is not
+      // the caller's problem to see as an error.
+      summary.failed += 1;
+      log.warn('roster sync skipped a rider', {
+        athlete_id: id,
+        error_name: err?.name,
+        error_code: err?.code ?? null,
+        error_message: err?.message,
+      });
+    }
+  }
+
+  return summary;
 }
 
 /**
