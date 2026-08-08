@@ -465,20 +465,37 @@ function stepMonth(direction) {
 /**
  * Refresh: POST /api/me/sync, whose response embeds a whole leaderboard payload, so this
  * is one round trip.
+ *
+ * `mode: 'full'` on an explicit press, and that is a bug fix rather than a preference. Omitting
+ * `mode` lets the server pick, and its auto rule is 'incremental' for the 24 hours after each full
+ * sync -- which asks Strava only for the months since the watermark, i.e. normally the current one.
+ * So a rider looking at a short July and pressing Refresh got a sync that could not possibly fix
+ * July, reported "Up to date.", and left the board unchanged. A button labelled Refresh has to
+ * actually re-ask for every month.
+ *
+ * The automatic boot sync stays on auto (`reason: 'first-sync'`): a brand-new rider has no
+ * `last_full_sync_at`, so auto already resolves to full for them, and a returning rider gets the
+ * cheap incremental on page load instead of a full rescan every time they open the tab.
+ *
+ * Cost, since a full sync is one Strava request per month: the 60-second per-athlete cooldown
+ * bounds a single rider to one of these a minute, and the client's own rate-limit reserve refuses
+ * to send rather than walking into a block -- surfacing as 429 `scope:"local"` with a wait time.
+ *
  * @param {{reason?: string}} [options]
  */
 async function refresh(options = {}) {
   if (state.syncing) return;
+  const firstSync = options.reason === 'first-sync';
   state.syncing = true;
   ui.removeBanner(BANNER.SYNC);
   ui.setRefreshPending(true);
-  ui.setStatus(options.reason === 'first-sync'
+  ui.setStatus(firstSync
     ? 'Fetching your rides from Strava for the first time…'
     : 'Syncing your rides from Strava…');
   try {
     // The month ON SCREEN goes with the sync, or the embedded board comes back for the
     // server's current month and Refresh silently snaps the view from June to August.
-    const result = await api.syncNow(undefined, state.month);
+    const result = await api.syncNow(firstSync ? undefined : 'full', state.month);
     const board = result?.leaderboard ?? null;
     // Hand the embedded board straight to loadAll instead of rendering it here and then
     // letting loadAll fetch and render it AGAIN. That double paint was the most visible

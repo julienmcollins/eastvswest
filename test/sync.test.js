@@ -645,14 +645,53 @@ test('auto mode picks incremental within a day of a full sync, and full again af
   const soon = NOW + 3600_000;
   const second = await syncAthlete(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: soon, force: true });
   assert.equal(second.mode, 'incremental');
-  // The incremental window starts at the watermark (padded by a day), so it re-reads only the
-  // tail -- which is the entire point of keeping one.
+  // The incremental plan starts at the watermark's month, so it re-reads only the tail -- which is
+  // the entire point of keeping a watermark.
   assert.ok(second.activitiesScanned < EXPECTED.total_records);
+  assert.deepEqual(second.monthsSynced, ['2026-09'], 'incremental must not re-walk the season');
 
   const later = NOW + 86_400_000 + 60_000;
   const third = await syncAthlete(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: later, force: true });
   assert.equal(third.mode, 'full', 'a stale last_full_sync_at forces a rescan');
   assert.equal(third.activitiesScanned, EXPECTED.total_records);
+});
+
+test('AUTO MODE CANNOT FIX AN OLD MONTH -- which is why Refresh sends mode:"full"', async () => {
+  // The reported bug, in the one place it can be pinned: "when I switch to July it's not showing
+  // most of my rides", and pressing Refresh changed nothing.
+  //
+  // `public/app.js` called `api.syncNow(undefined, month)`, so the SERVER chose the mode, and its
+  // auto rule is 'incremental' for the 24 hours after any full sync. An incremental asks only from
+  // the watermark's month onward, so it CANNOT re-fetch July however many times it runs -- and it
+  // still answers `ok`, so the client reported "Up to date." over an unchanged board. The fix is on
+  // the client (an explicit press sends 'full'), but the property that makes it necessary lives
+  // here, so this is where it is guarded.
+  const ctx = await setup();
+
+  // A completed full sync, so auto now resolves to incremental.
+  await sync(ctx, { mode: 'full' });
+
+  // Simulate what the rider is actually looking at: a July that is missing its rides. Deleting them
+  // is how a month ends up short without anything else being wrong.
+  await ctx.db.run(`DELETE FROM activities WHERE local_date LIKE '2026-07-%'`);
+  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-07-%'`), 0);
+
+  const soon = NOW + 120_000;
+
+  // Auto -> incremental. July is not even asked for, so pressing Refresh could not have helped.
+  const auto = await syncAthlete(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { nowMs: soon, force: true });
+  assert.equal(auto.mode, 'incremental');
+  assert.ok(!auto.monthsSynced.includes('2026-07'), 'incremental asked for July, which would invalidate this test');
+  assert.equal(await countRows(ctx.db, `local_date LIKE '2026-07-%'`), 0, 'auto mode recovered July, unexpectedly');
+
+  // An explicit full -- what the Refresh button now sends -- asks for every month, and July returns.
+  const explicit = await syncAthlete(ctx.db, ctx.config, ctx.strava, ATHLETE_ID, { mode: 'full', nowMs: soon, force: true });
+  assert.ok(explicit.monthsSynced.includes('2026-07'));
+  assert.equal(
+    await countRows(ctx.db, `local_date LIKE '2026-07-%' AND deleted_at IS NULL`),
+    ACTIVITY_FIXTURE.activities.filter((a) => String(a.start_date_local).startsWith('2026-07')).length,
+    'an explicit full sync must bring July back in full',
+  );
 });
 
 test('an explicit bad mode is a 400, not a 500', async () => {
